@@ -9777,12 +9777,15 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         expr_ref: ast::ExprRef,
     ) -> (PlaceAndQualifiers<'db>, Vec<(FileScopeId, ConstraintKey)>) {
         let env = self.program_environment();
-        let mode = if self.is_deferred() && self.in_string_annotation() {
+        let mode = if self.in_string_annotation() {
             PlaceLoadMode::StringAnnotation
-        } else if self.is_deferred() {
-            PlaceLoadMode::Deferred
         } else {
-            PlaceLoadMode::AtExpression(expr_ref)
+            match self.index.place_load_is_deferred(expr_ref) {
+                Some(true) => PlaceLoadMode::Deferred,
+                Some(false) => PlaceLoadMode::AtExpression(expr_ref),
+                None if self.is_deferred() => PlaceLoadMode::Deferred,
+                None => PlaceLoadMode::AtExpression(expr_ref),
+            }
         };
         let mut resolution =
             resolve_place_load(self.db(), self.index, self.scope(), place_expr, mode);

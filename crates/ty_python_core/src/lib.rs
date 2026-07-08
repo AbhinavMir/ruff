@@ -291,6 +291,12 @@ pub struct SemanticIndex<'db> {
     /// Map expressions to their corresponding scope.
     scopes_by_expression: ExpressionsScopeMap,
 
+    /// Place loads that use all bindings reachable in their scope.
+    deferred_place_loads: FrozenSet<ExpressionNodeKey>,
+
+    /// Whether type inference must classify place loads outside a known deferred context.
+    unclassified_place_loads_require_inference: bool,
+
     /// Map from a node creating a definition to its definition.
     definitions_by_node: DefinitionsByNode<'db>,
 
@@ -414,6 +420,21 @@ impl<'db> SemanticIndex<'db> {
         E: HasTrackedScope,
     {
         self.scopes_by_expression.try_get(expression)
+    }
+
+    /// Returns whether a place load uses all bindings reachable in its scope.
+    ///
+    /// Returns `None` when answering requires type inference. Callers that do not already have
+    /// that information should treat the load as unsupported.
+    pub fn place_load_is_deferred(&self, expression: ast::ExprRef<'_>) -> Option<bool> {
+        let expression = ExpressionNodeKey::from(expression);
+        if self.deferred_place_loads.contains(&expression) {
+            Some(true)
+        } else if self.unclassified_place_loads_require_inference {
+            None
+        } else {
+            Some(false)
+        }
     }
 
     /// Returns the [`Scope`] of the `expression`'s enclosing scope.
