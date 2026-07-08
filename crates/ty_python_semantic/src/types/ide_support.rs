@@ -25,10 +25,12 @@ use ty_module_resolver::{ImportingFile, Module, ResolverFile};
 use ty_python_core::definition::{Definition, DefinitionKind, NestedBindingExecution};
 use ty_python_core::{ProgramFile, attribute_scopes, global_scope, semantic_index, use_def_map};
 
+mod name_resolution;
 mod unreachable_code;
 #[path = "ide_support/unused_bindings.rs"]
 mod unused_binding_support;
 
+pub use name_resolution::{NameLoadResolution, ValueProviders};
 pub use resolve_definition::{ImportAliasResolution, ResolvedDefinition, map_stub_definition};
 use resolve_definition::{find_symbol_in_scope, resolve_definition};
 pub use unreachable_code::{UnreachableKind, UnreachableRange, unreachable_ranges};
@@ -1066,7 +1068,7 @@ fn collect_implementation_root_classes<'db>(
 /// end-of-scope bindings. Nested comprehensions can produce a chain of these proxies. Only
 /// follow sources that resolve to the same variable, so `global` and `nonlocal` writes do not
 /// become definitions of each other.
-fn user_visible_definitions<'db>(
+pub(crate) fn user_visible_definitions<'db>(
     db: &'db dyn Db,
     definitions: impl IntoIterator<Item = Definition<'db>>,
 ) -> FxIndexSet<Definition<'db>> {
