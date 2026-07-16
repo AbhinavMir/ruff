@@ -913,6 +913,23 @@ def g[T: A](b: B[T]):
     return f(b.x)  # Fine
 ```
 
+## Static upper bounds restrict gradual lower bounds
+
+When different arguments provide a gradual lower bound and a static upper bound for the same type
+variable, we preserve the static upper bound in the solution.
+
+```py
+from typing import Any, Callable
+from ty_extensions._internal import Unknown
+
+def infer[T](value: T, upper: Callable[[T], None]) -> T:
+    return value
+
+def check(any_value: Any, unknown_value: Unknown, upper: Callable[[int], None]):
+    reveal_type(infer(any_value, upper))  # revealed: int & Any
+    reveal_type(infer(unknown_value, upper))  # revealed: int & Unknown
+```
+
 ## Typevars in a union
 
 ```py

@@ -4113,6 +4113,33 @@ impl<'db> PathBounds<'db> {
                         return Err(());
                     }
 
+                    // Preserve the static upper bound of a gradual solution.
+                    //
+                    // If the same gradual type represents both the upper and lower bounds, we avoid
+                    // intersecting it with itself, as `Divergent` is not safely reflexive.
+                    if lower.bottom_materialization(db, env) != lower.top_materialization(db, env)
+                        && path_bound
+                            .upper
+                            .as_single_bound(db, env)
+                            .is_some_and(|upper| upper != lower)
+                        && path_bound.upper.clauses.iter().all(|upper| {
+                            !upper.has_typevar(db, env)
+                                && !upper.has_unspecialized_type_var(db, env)
+                        })
+                    {
+                        return Ok(IntersectionType::bounded_from_elements(
+                            db,
+                            env,
+                            path_bound
+                                .upper
+                                .clauses
+                                .iter()
+                                .copied()
+                                .chain(iter::once(declared_upper))
+                                .chain(iter::once(lower)),
+                        ));
+                    }
+
                     return Ok(Some(lower));
                 }
 
