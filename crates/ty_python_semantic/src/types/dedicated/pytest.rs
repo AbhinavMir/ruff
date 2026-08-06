@@ -9,6 +9,9 @@ use ty_python_core::{ProgramFile, global_scope, place_table, semantic_index, use
 
 use crate::Db;
 use crate::types::function::FunctionDecorators;
+use crate::types::ide_support::{
+    ResolvedDefinition, map_stub_definition, resolve_definition_targets,
+};
 use crate::types::infer::{
     function_known_decorator_flags, function_known_decorators, original_class_type,
 };
@@ -170,24 +173,26 @@ fn bindings_in_provider<'db>(
     for (symbol_id, definitions) in use_def.all_end_of_scope_symbol_bindings() {
         let symbol_name = table.symbol(symbol_id).name();
         for definition in definitions.filter_map(|binding| binding.binding.definition()) {
-            let Some(declaration) = fixture_declaration(db, definition) else {
-                continue;
-            };
-            let Some(exposure) = fixture_exposure(symbol_name, declaration) else {
-                continue;
-            };
-            if exposure.name != request.name
-                || exposure.declaration.definition == request.owner
-                || bindings
-                    .iter()
-                    .any(|binding: &FixtureBinding<'db>| binding.fixture == definition)
-            {
-                continue;
+            for definition in resolve_definition_targets(db, definition, symbol_name) {
+                for declaration in fixture_declarations_for_definition(db, definition) {
+                    let definition = declaration.definition;
+                    let Some(exposure) = fixture_exposure(symbol_name, declaration) else {
+                        continue;
+                    };
+                    if exposure.name != request.name
+                        || exposure.declaration.definition == request.owner
+                        || bindings
+                            .iter()
+                            .any(|binding: &FixtureBinding<'db>| binding.fixture == definition)
+                    {
+                        continue;
+                    }
+                    bindings.push(FixtureBinding {
+                        request: request.definition,
+                        fixture: definition,
+                    });
+                }
             }
-            bindings.push(FixtureBinding {
-                request: request.definition,
-                fixture: definition,
-            });
         }
     }
 
@@ -274,6 +279,23 @@ fn fixture_declaration<'db>(
     }
 
     None
+}
+
+fn fixture_declarations_for_definition<'db>(
+    db: &'db dyn Db,
+    definition: Definition<'db>,
+) -> Vec<FixtureDeclaration<'db>> {
+    if definition.file(db).is_stub(db) {
+        let resolved = ResolvedDefinition::Definition(definition);
+        if let Some(mapped) = map_stub_definition(db, &resolved, None) {
+            return mapped
+                .into_iter()
+                .filter_map(|resolved| resolved.definition())
+                .filter_map(|definition| fixture_declaration(db, definition))
+                .collect();
+        }
+    }
+    fixture_declaration(db, definition).into_iter().collect()
 }
 
 fn fixture_name_from_arguments(arguments: &ast::Arguments) -> FixtureName {
@@ -721,6 +743,172 @@ def test_use(value): ...
         Ok(())
     }
 
+    #[test]
+    fn resolves_imported_fixture_exposures() -> Result<()> {
+        let db = pytest_db_with_files(&[
+            (
+                "/src/fixtures.py",
+                r#"
+import pytest
+
+@pytest.fixture
+def resource(): ...
+
+@pytest.fixture(name="public_name")
+def implementation(): ...
+"#,
+            ),
+            (
+                "/src/reexports.py",
+                r#"
+from fixtures import resource as middle
+"#,
+            ),
+            (
+                "/src/star_fixtures.py",
+                r#"
+import pytest
+
+@pytest.fixture
+def star_fixture(): ...
+"#,
+            ),
+            (
+                "/src/test_example.py",
+                r#"
+from fixtures import resource as direct_alias, implementation
+from reexports import middle as chained
+from star_fixtures import *
+
+def test_use(
+    direct_alias,
+    chained,
+    public_name,
+    implementation,
+    resource,
+    star_fixture,
+): ...
+"#,
+            ),
+        ])?;
+
+        assert_eq!(fixture_names(&db, "test_use", "direct_alias"), ["resource"]);
+        assert_eq!(fixture_names(&db, "test_use", "chained"), ["resource"]);
+        assert_eq!(
+            fixture_names(&db, "test_use", "public_name"),
+            ["implementation"]
+        );
+        assert_eq!(
+            fixture_names(&db, "test_use", "star_fixture"),
+            ["star_fixture"]
+        );
+        assert!(fixture_names(&db, "test_use", "implementation").is_empty());
+        assert!(fixture_names(&db, "test_use", "resource").is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_imported_fixture_declarations_from_source() -> Result<()> {
+        let db = pytest_db_with_files(&[
+            (
+                "/src/fixtures.py",
+                r#"
+import pytest
+
+@pytest.fixture(name="public_name")
+def implementation(): ...
+"#,
+            ),
+            ("/src/fixtures.pyi", "def implementation() -> object: ...\n"),
+            (
+                "/src/test_example.py",
+                r#"
+from fixtures import implementation
+
+def test_use(public_name): ...
+"#,
+            ),
+        ])?;
+
+        let request = parameter_definition(&db, "test_use", "public_name");
+        let fixture_files: Vec<_> = fixture_bindings_for_parameter(&db, request)
+            .iter()
+            .map(|binding| binding.fixture().file(&db).path(&db).to_string())
+            .collect();
+        assert_eq!(fixture_files, ["/src/fixtures.py"]);
+        Ok(())
+    }
+
+    #[test]
+    fn ignores_overwritten_imported_fixture_exposures() -> Result<()> {
+        let db = pytest_db_with_files(&[
+            (
+                "/src/fixtures.py",
+                r#"
+import pytest
+
+@pytest.fixture
+def resource(): ...
+"#,
+            ),
+            (
+                "/src/test_example.py",
+                r#"
+from fixtures import resource
+
+resource = object()
+
+def test_use(resource): ...
+"#,
+            ),
+        ])?;
+
+        assert!(fixture_names(&db, "test_use", "resource").is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn preserves_conditional_imported_fixture_definitions() -> Result<()> {
+        let db = pytest_db_with_files(&[
+            (
+                "/src/first.py",
+                r#"
+import pytest
+
+@pytest.fixture
+def first(): ...
+"#,
+            ),
+            (
+                "/src/second.py",
+                r#"
+import pytest
+
+@pytest.fixture
+def second(): ...
+"#,
+            ),
+            (
+                "/src/test_example.py",
+                r#"
+flag: bool
+
+if flag:
+    from first import first as resource
+else:
+    from second import second as resource
+
+def test_use(resource): ...
+"#,
+            ),
+        ])?;
+
+        let mut fixtures = fixture_names(&db, "test_use", "resource");
+        fixtures.sort();
+        assert_eq!(fixtures, ["first", "second"]);
+        Ok(())
+    }
+
     fn fixture_names(db: &TestDb, function: &str, parameter: &str) -> Vec<String> {
         let parameter = parameter_definition(db, function, parameter);
         fixture_bindings_for_parameter(db, parameter)
@@ -788,7 +976,11 @@ def test_use(value): ...
     }
 
     fn pytest_db(path: &'static str, source: &'static str) -> Result<TestDb> {
-        TestDbBuilder::new()
+        pytest_db_with_files(&[(path, source)])
+    }
+
+    fn pytest_db_with_files(files: &[(&'static str, &'static str)]) -> Result<TestDb> {
+        let mut builder = TestDbBuilder::new()
             .with_site_packages()
             .with_file("/site-packages/_pytest/__init__.pyi", "")
             .with_file("/site-packages/_pytest/mark/__init__.pyi", "")
@@ -828,8 +1020,10 @@ from _pytest.mark.structures import MarkGenerator
 
 mark: MarkGenerator
 "#,
-            )
-            .with_file(path, source)
-            .build()
+            );
+        for (path, source) in files {
+            builder = builder.with_file(*path, source);
+        }
+        builder.build()
     }
 }
