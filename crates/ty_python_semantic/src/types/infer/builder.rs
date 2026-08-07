@@ -7643,7 +7643,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             .origin(self.db())
             .apply_specialization(db, |_| {
                 builder.build_with(generic_context, |current_typevar, bounds| {
-                    let lower = bounds?.lower?;
+                    let lower = bounds?.evidence_lower?;
 
                     let lower = if is_empty_collection_type_context(tcx) {
                         // Constraints learned from later collection uses follow the same promotion

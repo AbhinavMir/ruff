@@ -5762,7 +5762,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                 return None;
             }
 
-            let lower = bounds.lower?;
+            let lower = bounds.evidence_lower?;
             let promoted = lower.promote(db, self.env);
 
             // If the TypeVar has an upper bound, only use the promoted type if it
@@ -5778,7 +5778,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
 
         let mut choose = |typevar: BoundTypeVarInstance<'db>, bounds: Option<&PathBound<'db>>| {
             let bounds = bounds?;
-            if let Some(lower) = bounds.lower
+            if let Some(lower) = bounds.evidence_lower
                 && let Some(&preferred_ty) = preferred_type_mappings.get(&typevar.identity(db))
                 && lower.is_assignable_to(db, self.env, preferred_ty)
             {
