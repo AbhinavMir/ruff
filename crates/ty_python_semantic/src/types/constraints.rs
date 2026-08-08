@@ -2006,6 +2006,57 @@ pub(crate) struct ConstraintBounds<'db> {
     pub(crate) upper: ConstraintBound<'db>,
 }
 
+impl<'db> Type<'db> {
+    /// Returns whether this type can be used to derive additional constraints via a sequent map.
+    ///
+    /// Sequent maps depend on (and encode) transitivity. Our assignability relation is not
+    /// transitive, which means that dynamic types cannot participate sequent derivations.
+    ///
+    /// Normally we check whether a type is dynamic by comparing its top and bottom
+    /// materializations. This doesn't work for the sequent map, since we need to treat typevars as
+    /// fully opaque. Materialization applies recursively to the declared bounds/constraints of a
+    /// typevar, which would incorrectly mark it as dynamic if it has a dynamic bound or
+    /// constraint. So instead, we have to manually walk the structure of a type, looking for
+    /// dynamic components, while not recursing into the bounds/constraints of any typevars we
+    /// encounter.
+    fn is_static_sequent_eligible(self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> bool {
+        struct EligibilityVisitor<'a, 'db> {
+            env: &'a ProgramEnvironment<'db>,
+            seen: TypeCollector<'db>,
+            eligible: Cell<bool>,
+        }
+
+        impl<'db> TypeVisitor<'db> for EligibilityVisitor<'_, 'db> {
+            fn program_environment(&self) -> &ProgramEnvironment<'db> {
+                self.env
+            }
+
+            fn should_visit_lazy_type_attributes(&self) -> bool {
+                false
+            }
+
+            fn visit_type(&self, db: &'db dyn Db, ty: Type<'db>) {
+                if !self.eligible.get() || ty.is_type_var() {
+                    return;
+                }
+                if ty.is_dynamic() {
+                    self.eligible.set(false);
+                    return;
+                }
+                walk_type_with_recursion_guard(db, ty, self, &self.seen);
+            }
+        }
+
+        let visitor = EligibilityVisitor {
+            env,
+            seen: TypeCollector::default(),
+            eligible: Cell::new(true),
+        };
+        visitor.visit_type(db, self);
+        visitor.eligible.get()
+    }
+}
+
 impl<'db> ConstraintBounds<'db> {
     pub(crate) fn new(lower: ConstraintBound<'db>, upper: ConstraintBound<'db>) -> Self {
         Self { lower, upper }
@@ -2698,16 +2749,19 @@ impl ConstraintId {
         {
             return false;
         }
-        other_constraint
-            .bounds
-            .lower
-            .ty()
-            .is_constraint_set_assignable_to(db, env, self_constraint.bounds.lower.ty())
-            && self_constraint
-                .bounds
-                .upper
-                .ty()
-                .is_constraint_set_assignable_to(db, env, other_constraint.bounds.upper.ty())
+        let other_lower = other_constraint.bounds.lower.ty();
+        let self_lower = self_constraint.bounds.lower.ty();
+        let self_upper = self_constraint.bounds.upper.ty();
+        let other_upper = other_constraint.bounds.upper.ty();
+        if !other_lower.is_static_sequent_eligible(db, env)
+            || !self_lower.is_static_sequent_eligible(db, env)
+            || !self_upper.is_static_sequent_eligible(db, env)
+            || !other_upper.is_static_sequent_eligible(db, env)
+        {
+            return false;
+        }
+        storage.cached_is_constraint_set_subtype_of(db, env, other_lower, self_lower)
+            && storage.cached_is_constraint_set_subtype_of(db, env, self_upper, other_upper)
     }
 
     /// Returns the intersection of two range constraints, or `None` if the intersection is empty.
@@ -2743,12 +2797,21 @@ impl ConstraintId {
         merged_upper.add_clause(self_constraint.bounds.upper);
         merged_upper.add_clause(other_constraint.bounds.upper);
 
-        // If `lower ≰ upper` for every possible assignment of typevars, then the intersection is
-        // empty, since there is no type that is both greater than `lower`, and less than `upper`.
-        // We use an existential check here ("is there *some* assignment where `lower ≤ upper`?")
-        // rather than a universal check ("is `lower ≤ upper` for *all* assignments?"), because the
-        // bounds may mention typevars — e.g., `Sequence[int] ≤ A ≤ Sequence[T]` is satisfiable
-        // when `int ≤ T`, even though it's not universally true for all `T`.
+        if !effective_lower.is_static_sequent_eligible(db, env)
+            || merged_upper
+                .iter_clauses()
+                .any(|upper| !upper.ty().is_static_sequent_eligible(db, env))
+        {
+            return IntersectionResult::CannotSimplify;
+        }
+
+        // Sequent derivation can run while the owned assignability query is evaluating a recursive
+        // relation. We need to use the same assignability query below to ensure that salsa cycle
+        // handling doesn't introduce incorrect sequents.
+        //
+        // The eligibility check above makes this safe: assignability and subtyping coincide for
+        // the concrete types, while typevars remain opaque and can propagate an existing gradual
+        // witness.
         let (when, source_order) =
             merged_upper.when_satisfied_by(db, env, storage, effective_lower);
         if when.is_never_satisfied(db, env, storage, source_order) {
@@ -5301,9 +5364,11 @@ impl SequentMap {
         // This call might need its own borrow of the builder's storage, so create a new builder
         // that it can use.
         let builder = ConstraintSetBuilder::new();
-        left_lower
-            .when_trivially_disjoint_from(db, env, right_lower, &builder, TypeVarSet::None)
-            .is_trivially_always_satisfied()
+        left_lower.is_static_sequent_eligible(db, env)
+            && right_lower.is_static_sequent_eligible(db, env)
+            && left_lower
+                .when_trivially_disjoint_from(db, env, right_lower, &builder, TypeVarSet::None)
+                .is_trivially_always_satisfied()
     }
 
     fn add_single_tautology(&mut self, ante: ConstraintId) {
@@ -5324,20 +5389,27 @@ impl SequentMap {
         ante2: ConstraintId,
         post: ConstraintId,
     ) {
-        // If the post constraint is unsatisfiable, then the antecedents contradict each other.
+        // If the post constraint is statically unsatisfiable, then the antecedents contradict
+        // each other. Gradual bounds cannot prove a contradiction.
         let post_data = storage.constraint_data(post);
-        let (when, source_order) = storage.load(
-            db,
-            env,
-            &post_data
-                .bounds
-                .lower
-                .ty()
-                .when_constraint_set_assignable_to_owned(db, env, post_data.bounds.upper.ty()),
-        );
-        if when.is_never_satisfied(db, env, storage, source_order) {
-            self.add_pair_impossibility(ante1, ante2);
-            return;
+        let post_lower = post_data.bounds.lower.ty();
+        let post_upper = post_data.bounds.upper.ty();
+        if post_lower.is_static_sequent_eligible(db, env)
+            && post_upper.is_static_sequent_eligible(db, env)
+        {
+            // Reuse the owned assignability query so recursive sequent derivation stays within the
+            // same coinductive Salsa computation. A separate owned subtyping query can produce an
+            // inconsistent provisional answer. The eligibility checks make this safe for concrete
+            // components, while symbolic typevars can still propagate existing gradual witnesses.
+            let (when, source_order) = storage.load(
+                db,
+                env,
+                &post_lower.when_constraint_set_assignable_to_owned(db, env, post_upper),
+            );
+            if when.is_never_satisfied(db, env, storage, source_order) {
+                self.add_pair_impossibility(ante1, ante2);
+                return;
+            }
         }
 
         // If either antecedent implies the consequent on its own, this new sequent is redundant,
@@ -5436,6 +5508,10 @@ impl SequentMap {
         // when `L ≤ U`. This gives us a constraint set, which should be the rhs of the sequent
         // implication. (That is, this check directly encodes `(L ≤ T ≤ U) → (L ≤ U)` as an
         // implication.)
+        //
+        // TODO: Use the fully static sequent boundary here once lazy subtyping can preserve an
+        // existing gradual witness instead of materializing it away (see PR #26873). Until then,
+        // keep this dedicated single-range symbolic derivation assignability-based.
 
         // Skip trivial cases where the assignability check won't produce useful results.
         if lower.is_never() || upper.is_object() {
@@ -5687,11 +5763,13 @@ impl SequentMap {
             (_, constrained_upper, bound_lower, _)
                 if !constrained_upper.is_never()
                     && !constrained_upper.is_object()
+                    && constrained_upper.is_static_sequent_eligible(db, env)
+                    && bound_lower.is_static_sequent_eligible(db, env)
                     && storage.cached_is_constraint_set_subtype_of(
                         db,
                         env,
-                        constrained_upper.top_materialization(db, env),
-                        bound_lower.bottom_materialization(db, env),
+                        constrained_upper,
+                        bound_lower,
                     ) =>
             {
                 (
@@ -5708,11 +5786,13 @@ impl SequentMap {
             (constrained_lower, _, _, bound_upper)
                 if !constrained_lower.is_never()
                     && !constrained_lower.is_object()
+                    && bound_upper.is_static_sequent_eligible(db, env)
+                    && constrained_lower.is_static_sequent_eligible(db, env)
                     && storage.cached_is_constraint_set_subtype_of(
                         db,
                         env,
-                        bound_upper.top_materialization(db, env),
-                        constrained_lower.bottom_materialization(db, env),
+                        bound_upper,
+                        constrained_lower,
                     ) =>
             {
                 (
