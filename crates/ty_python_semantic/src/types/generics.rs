@@ -2987,7 +2987,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
     ) -> Option<SpecializationError<'db>> {
         let db = self.db;
         let bound_typevar = path_bound.bound_typevar;
-        let argument = path_bound.evidence_lower?;
+        let argument = path_bound.inference_lower(db, self.env)?;
         match bound_typevar
             .typevar(db)
             .bound_or_constraints(db, self.env)?
