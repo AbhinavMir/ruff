@@ -10,7 +10,9 @@ use ty_static::EnvVars;
 
 use super::python_version::SupportedPythonVersion;
 
-pub(super) use sync::{ScriptSyncTask, UvSyncService};
+pub use sync::ScriptSyncResult;
+pub(super) use sync::ScriptSyncTask;
+pub(super) use sync::{ScriptEnvironmentCacheKey, ScriptSyncRequest, UvSyncService};
 
 mod sync;
 
