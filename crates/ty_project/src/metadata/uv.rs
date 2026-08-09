@@ -10,6 +10,11 @@ use ty_static::EnvVars;
 
 use super::python_version::SupportedPythonVersion;
 
+pub(super) use sync::{ScriptSyncTask, UvSyncService};
+
+mod sync;
+
+#[derive(Clone)]
 pub(super) struct Uv {
     executable: String,
 }
