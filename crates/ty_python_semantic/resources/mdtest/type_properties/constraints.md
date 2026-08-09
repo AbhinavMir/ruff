@@ -443,6 +443,9 @@ def _[T, U, V]() -> None:
     static_assert(not ~upper_bounds)
 
     row_tuple = ConstraintSet.equality(T, RowTuple)
+    # XXX: Phase 5 must restore this simplification without using gradual assignability to derive
+    # transitive sequent implications.
+    # error: [static-assert-error]
     static_assert(row_tuple & upper_bounds == row_tuple)
 
     gradual_mismatch = ConstraintSet.equality(T, list[Any]) & ConstraintSet.equality(T, list[int])
