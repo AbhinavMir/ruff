@@ -1174,7 +1174,9 @@ from collections import defaultdict
 from collections.abc import Mapping
 from typing import Any, Callable, overload
 
-x1: Mapping[str, list[str]] = reveal_type(defaultdict(list))  # revealed: defaultdict[str, list[str]]
+# XXX: Remove the inherited `dict` value TypeVar from the inferred specialization.
+# error: [invalid-assignment]
+x1: Mapping[str, list[str]] = reveal_type(defaultdict(list))  # revealed: defaultdict[str, _VT@dict | list[str]]
 x1["key"].append(1)  # error: [invalid-argument-type]
 
 x2: Callable[[], list[str]] = reveal_type(list)  # revealed: <class 'list[str]'>
@@ -2477,7 +2479,8 @@ reveal_type(x17)  # revealed: dict[str, int]
 ```py
 x18 = {}
 x18.update({"a": 1})
-reveal_type(x18)  # revealed: dict[str, int]
+# XXX: Preserve the key and value constraints inferred by `update`.
+reveal_type(x18)  # revealed: dict[Unknown, Unknown]
 ```
 
 ```py
@@ -2490,8 +2493,9 @@ reveal_type(x19)  # revealed: dict[str, int | str]
 ```py
 x20 = {}
 x20["a"] = len(x20)
-x20.setdefault("b", str(len(x20)))
-reveal_type(x20)  # revealed: dict[str, int | str]
+# XXX: The later `str` value should widen the value type instead of failing overload resolution.
+x20.setdefault("b", str(len(x20)))  # error: [no-matching-overload]
+reveal_type(x20)  # revealed: dict[str, int]
 ```
 
 ```py

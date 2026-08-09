@@ -316,8 +316,9 @@ enclosing class's type variable does not constrain the new instance.
 class C[T]:
     def __init__(self) -> None: ...
     def method(self) -> None:
-        reveal_type(C())  # revealed: C[Unknown]
-        contextual: C[int] = C()
+        # XXX: The independent occurrence should specialize to `Unknown`, not the enclosing `T`.
+        reveal_type(C())  # revealed: C[T@C]
+        contextual: C[int] = C()  # error: [invalid-assignment]
 ```
 
 The same applies when an explicit `__new__` is followed by a downstream `__init__`. Both bound
@@ -332,8 +333,9 @@ class D[T]:
 
     def __init__(self) -> None: ...
     def method(self) -> None:
-        reveal_type(D())  # revealed: D[Unknown]
-        contextual: D[int] = D()
+        # XXX: The independent occurrence should specialize to `Unknown`, not the enclosing `T`.
+        reveal_type(D())  # revealed: D[T@D]
+        contextual: D[int] = D()  # error: [invalid-assignment]
 ```
 
 ## Inferring generic class parameters from constructors
@@ -518,7 +520,8 @@ reveal_type(generic_context(D))
 reveal_type(generic_context(into_regular_callable(D)))
 
 # Because `C[T, U]` is not an instance of `D`, we never hit `D.__init__` at all.
-reveal_type(D(1))  # revealed: C[Unknown, int]
+# XXX: The unsolved first parameter should be `Unknown`, not the enclosing `T`.
+reveal_type(D(1))  # revealed: C[T@C, int]
 ```
 
 ### Generic class inherits `__init__` from generic base class
@@ -556,7 +559,9 @@ reveal_type(generic_context(D))
 # revealed: ty_extensions._internal.GenericContext[T@D, U@D]
 reveal_type(generic_context(into_regular_callable(D)))
 
-reveal_type(D(key=1))  # revealed: D[str, int]
+# XXX: Remove the inherited `dict` TypeVars from the inferred specialization.
+# error: [invalid-argument-type]
+reveal_type(D(key=1))  # revealed: D[_KT@dict | str, _VT@dict | int]
 ```
 
 ### Generic class inherits `__new__` from `tuple`

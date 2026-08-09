@@ -2577,7 +2577,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         // was not enough: `solutions_with` still performed the expensive path traversal, and the
         // skipped projection changed precision in LiteralString tests. See the
         // `ty_micro[pydantic_core_schema_dict]` benchmark for a minimized reproducer.
-        let solutions = match self.pending.solutions_with(
+        let solutions = match self.pending.pruned_solutions_with(
             db,
             self.env,
             self.constraints,
@@ -2941,23 +2941,30 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         set: ConstraintSet<'db, 'c>,
     ) -> Result<(), ConstraintSetInferenceError<'db>> {
         let db = self.db;
-        let mut first_error = None;
-        let solutions = match set.solutions_with(
+        let solutions = match set.pruned_solutions_with(
             db,
             self.env,
             self.constraints,
             self.inferable,
             |_variance, path_bound| {
-                let solution =
-                    PathBounds::default_solve(db, self.env, self.constraints, path_bound);
-                if solution.is_err() && first_error.is_none() {
-                    first_error = self.specialization_error_from_failed_bounds(path_bound);
-                }
-                solution
+                PathBounds::default_solve(db, self.env, self.constraints, path_bound)
             },
         ) {
             Solutions::Unsatisfiable => {
-                return Err(first_error.map_or(
+                let error = match set.unconjoined_path_bounds(
+                    db,
+                    self.env,
+                    self.constraints,
+                    self.inferable,
+                ) {
+                    PathBounds::Constrained(paths) => {
+                        paths.iter().flatten().find_map(|path_bound| {
+                            self.specialization_error_from_failed_bounds(path_bound)
+                        })
+                    }
+                    PathBounds::Unsatisfiable | PathBounds::Unconstrained => None,
+                };
+                return Err(error.map_or(
                     ConstraintSetInferenceError::Unsatisfiable,
                     ConstraintSetInferenceError::InvalidTypeVar,
                 ));

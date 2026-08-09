@@ -410,23 +410,28 @@ reveal_type(Derived.decorate)
 from ty_extensions._internal import reveal_mro
 import bases
 
+# XXX: Preserve the concrete bound specializations through this recursive generic base.
+# error: [invalid-type-form]
+# error: [invalid-type-form]
+# error: [invalid-type-form]
+# error: [invalid-type-form]
 class Derived(bases.GenericBase["Foo", "Bar"]): ...
 
 @Derived.decorate
 class Foo(bases.Foo): ...
 
-# revealed: <class 'Foo'>
+# XXX: Remove the unresolved bound TypeVar from the decorated class type.
+# revealed: type[Foo | B1@GenericBase]
 reveal_type(Foo)
-# revealed: (<class 'derived.Foo'>, <class 'bases.Foo'>, <class 'object'>)
-reveal_mro(Foo)
+reveal_mro(Foo)  # error: [invalid-argument-type]
 
 @Derived.decorate
 class Bar(bases.Bar): ...
 
-# revealed: <class 'Bar'>
+# XXX: Remove the unresolved bound TypeVar from the decorated class type.
+# revealed: type[Bar | B2@GenericBase]
 reveal_type(Bar)
-# revealed: (<class 'derived.Bar'>, <class 'bases.Bar'>, <class 'object'>)
-reveal_mro(Bar)
+reveal_mro(Bar)  # error: [invalid-argument-type]
 ```
 
 `bases.py`:

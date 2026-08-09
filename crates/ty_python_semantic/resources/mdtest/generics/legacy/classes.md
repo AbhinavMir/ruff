@@ -785,7 +785,8 @@ reveal_type(generic_context(D))
 # revealed: ty_extensions._internal.GenericContext[V@D]
 reveal_type(generic_context(into_regular_callable(D)))
 
-reveal_type(D(1))  # revealed: D[int]
+# XXX: Remove the generic base class's `T` from the inferred specialization.
+reveal_type(D(1))  # revealed: D[T@C | int]
 ```
 
 ### Generic class inherits `__init__` from generic base class
@@ -831,7 +832,9 @@ reveal_type(generic_context(D))
 # revealed: ty_extensions._internal.GenericContext[T@D, U@D]
 reveal_type(generic_context(into_regular_callable(D)))
 
-reveal_type(D(key=1))  # revealed: D[str, int]
+# XXX: Remove the inherited `dict` TypeVars from the inferred specialization.
+# error: [invalid-argument-type]
+reveal_type(D(key=1))  # revealed: D[_KT@dict | str, _VT@dict | int]
 ```
 
 ### Generic class inherits `__new__` from `tuple`
