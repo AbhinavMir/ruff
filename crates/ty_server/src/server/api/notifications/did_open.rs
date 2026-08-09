@@ -31,6 +31,7 @@ impl SyncNotificationHandler for DidOpenTextDocumentHandler {
 
         let text_doc = TextDocument::new(uri, text, version, language_id);
         let document = session.open_text_document(text_doc);
+        session.synchronize_script(client, document.notebook_or_file_path());
         publish_diagnostics_if_needed(&document, session, client);
 
         Ok(())

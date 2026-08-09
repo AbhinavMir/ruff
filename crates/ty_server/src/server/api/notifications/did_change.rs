@@ -3,6 +3,7 @@ use lsp_types::{
     DidChangeTextDocumentNotification, DidChangeTextDocumentParams, TextDocumentIdentifier,
     VersionedTextDocumentIdentifier,
 };
+use ty_project::Db as _;
 
 use crate::server::Result;
 use crate::server::api::LSPResult;
@@ -39,6 +40,12 @@ impl SyncNotificationHandler for DidChangeTextDocumentHandler {
         document
             .update_text_document(session, content_changes, version)
             .with_failure_code(ErrorCode::InternalError)?;
+
+        let db = session.project_db_mut(document.notebook_or_file_path());
+        if let Some(file) = document.notebook_or_file(db) {
+            let environments = db.script_environments().clone();
+            environments.ensure_environment_available(db, file);
+        }
 
         publish_diagnostics_if_needed(&document, session, client);
 

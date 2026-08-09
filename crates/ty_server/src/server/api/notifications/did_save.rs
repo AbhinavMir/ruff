@@ -16,8 +16,12 @@ impl SyncNotificationHandler for DidSaveTextDocumentHandler {
     fn run(
         session: &mut Session,
         client: &Client,
-        _params: DidSaveTextDocumentParams,
+        params: DidSaveTextDocumentParams,
     ) -> Result<()> {
+        if let Ok(document) = session.document_handle(&params.text_document.uri) {
+            session.synchronize_script(client, document.notebook_or_file_path());
+        }
+
         for document in session.file_document_handles() {
             publish_diagnostics_if_needed(&document, session, client);
         }

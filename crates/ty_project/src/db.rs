@@ -108,6 +108,7 @@ impl ProjectDatabase {
     where
         S: System + 'static + Send + Sync + RefUnwindSafe,
     {
+        let script_environments = ScriptEnvironments::new(project_metadata.use_uv());
         let mut db = Self {
             project: None,
             storage: salsa::Storage::new(if tracing::enabled!(tracing::Level::TRACE) {
@@ -124,7 +125,7 @@ impl ProjectDatabase {
                 None
             }),
             files: Files::default(),
-            script_environments: ScriptEnvironments::default(),
+            script_environments,
             system: Arc::new(system),
         };
 
@@ -692,6 +693,7 @@ pub(crate) mod testing {
     impl TestDb {
         pub fn new(project: ProjectMetadata) -> Self {
             let events = Events::default();
+            let script_environments = ScriptEnvironments::new(project.use_uv());
             let mut db = Self {
                 storage: salsa::Storage::new(Some(Box::new({
                     let events = events.clone();
@@ -703,7 +705,7 @@ pub(crate) mod testing {
                 system: TestSystem::default(),
                 vendored: ty_vendored::file_system().clone(),
                 files: Files::default(),
-                script_environments: ScriptEnvironments::default(),
+                script_environments,
                 events,
                 project: None,
             };

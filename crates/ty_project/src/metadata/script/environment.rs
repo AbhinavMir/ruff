@@ -11,6 +11,16 @@
 //! check until all pending synchronizations finish, so the check uses environments matching the
 //! changed scripts. If more changes arrive while uv is running, only the latest requested
 //! environment is synchronized next.
+//!
+//! The language server starts synchronization when a script is opened or saved, and when a known
+//! closed script changes on disk. It does not run uv for every unsaved edit because uv reads the
+//! script from disk. Until those edits are saved, the script continues using its last completed
+//! environment. A file that becomes a script through an unsaved edit uses its default environment.
+//!
+//! The language server does not block editor requests while uv runs. If no usable environment
+//! exists yet, semantic analysis skips the script rather than reporting diagnostics from the wrong
+//! environment. When refreshing an existing environment, analysis continues using the last
+//! completed environment so diagnostics do not disappear temporarily.
 
 use std::hash::Hasher;
 use std::sync::Arc;
@@ -23,23 +33,24 @@ use ruff_db::FxDashMap;
 use ruff_db::files::{File, Files};
 use ruff_db::system::SystemPathBuf;
 use salsa::Setter;
-use ty_static::EnvVars;
 
 use super::script_tag;
 use crate::metadata::uv::{
     ScriptEnvironmentCacheKey, ScriptSyncRequest, ScriptSyncResult, ScriptSyncTask, Uv, UvMetadata,
     UvSyncService,
 };
-use crate::{Db, ProgressReporter, ScriptSyncProgress};
+use crate::{Db, ProgressReporter, ScriptSyncProgress, UseUv};
 
 const CANCELLATION_CHECK_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Returns the script environment input for `file`.
 ///
 /// Project checks call [`ScriptEnvironments::ensure_environment_initialized`] before entering
-/// semantic queries. CLI watch mode calls [`ScriptEnvironments::schedule_sync`] after filesystem
-/// changes, which creates the input before submitting the background work. A missing input means
-/// that semantic analysis started without either path preparing the script first.
+/// semantic queries. CLI watch mode and the language server call
+/// [`ScriptEnvironments::schedule_sync`] to create the input and submit background work. When an
+/// unsaved edit first adds a script block, the language server calls
+/// [`ScriptEnvironments::ensure_environment_available`] because uv cannot read the edit from disk
+/// yet. A missing input means semantic analysis started without one of these steps.
 pub(super) fn script_environment(db: &dyn Db, file: File) -> Option<ScriptEnvironment> {
     db.script_environments().environment(db, file)
 }
@@ -51,6 +62,15 @@ pub struct ScriptEnvironments {
 }
 
 impl ScriptEnvironments {
+    pub(crate) fn new(use_uv: UseUv) -> Self {
+        Self {
+            inner: Arc::new(ScriptEnvironmentsInner {
+                use_uv,
+                ..ScriptEnvironmentsInner::default()
+            }),
+        }
+    }
+
     /// Returns completed background synchronizations.
     pub fn sync_results(&self) -> Receiver<ScriptSyncResult> {
         self.inner.sync_service.results()
@@ -62,34 +82,62 @@ impl ScriptEnvironments {
     /// scripts synchronously. This may invoke uv and creates the [`ScriptEnvironment`] input that
     /// semantic queries depend on.
     ///
-    /// Concurrent callers wait for the initial environment creation to finish.
-    /// If blocking initialization is cancelled or otherwise unwinds, the environment remains
-    /// uninitialized and waiters are woken so a caller can retry.
+    /// Concurrent callers wait for blocking initialization to finish. If the CLI watch loop or
+    /// language server has already scheduled the first synchronization in the background, this
+    /// returns [`Pending`] instead. If blocking initialization is cancelled or otherwise unwinds,
+    /// the environment remains uninitialized and waiters are woken so a caller can retry.
+    ///
+    /// [`Pending`]: EnvironmentReadiness::Pending
     pub(crate) fn ensure_environment_initialized(
         &self,
         db: &dyn Db,
         file: File,
         reporter: &dyn ProgressReporter,
-    ) {
-        if !script_integration_enabled(db) {
-            return;
+    ) -> EnvironmentReadiness {
+        if !self.is_enabled() {
+            return EnvironmentReadiness::Ready;
         }
 
         let Some(task) = script_sync_task(db, file) else {
-            return;
+            return EnvironmentReadiness::Ready;
         };
         let entry = self.entry(file);
 
         let mut state = entry.state.lock();
-        // An initializer that is cancelled or otherwise unwinds restores the state to `Vacant`.
-        // Re-check the state after waiting so this caller can take over the abandoned work.
         loop {
             match &*state {
+                // We have an initialized environment for this script. Use it.
+                // There are two cases where we hit current:
+                // * The environment is fully synced. This is the common case
+                // * A user adds a script metadata block to a file, the file is not saved yet.
+                //   We can't run `uv metadata`, because the changes aren't saved.
+                //   But we also can't return empty diagnostics (saying the env is pending),
+                //   because that would make all existing diagnostics disappear, only so that
+                //   most/many of them reappear once the sync is complete. Now, there's an argument that
+                //   many of the diagnostics are due to missing imports. Well, maybe, we don't know.
+                //   For now, use an empty virtual environment for the script and we can iterate on this based
+                //   on user feedback.
+                ScriptEnvironmentEntryState::Current { .. } => {
+                    return EnvironmentReadiness::Ready;
+                }
+
+                // We have an existing virtual environment, but it is in the progress of re-syncing.
+                // Keep using the existing virtual environment to avoid disappearing and reappearing
+                // diagnostics in the LSP case. ty will schedule a recheck when the environment is fully
+                // synced.
+                ScriptEnvironmentEntryState::Synchronizing { readiness, .. } => {
+                    return *readiness;
+                }
+
+                // This script is currently synchronized on another thread. Wait for it to complete.
                 ScriptEnvironmentEntryState::Initializing { .. } => {
+                    // An initializer that is cancelled or otherwise unwinds restores the state to `Vacant`.
+                    // Re-check the state after waiting to reschedule if necessary.
                     state = entry.wait_until_initialized(db, state);
                 }
-                ScriptEnvironmentEntryState::Current { .. }
-                | ScriptEnvironmentEntryState::Synchronizing { .. } => return,
+
+                // This is a script that was never synced before (or the sync was cancelled).
+                // Schedule a sync on the background thread, wait for it to complete.
                 ScriptEnvironmentEntryState::Vacant => {
                     let cache_key = task.request.cache_key();
                     *state = ScriptEnvironmentEntryState::Initializing {
@@ -104,11 +152,14 @@ impl ScriptEnvironments {
                         task.request.path()
                     );
 
+                    // Run the sync
                     let output = {
                         let _progress = reporter.for_script(db, file);
                         self.inner.sync_service.run(db, task)
                     };
 
+                    // Parse the output and create the script environment
+                    // (remembering the cache key and any initialization errors)
                     let (uv_metadata, initialization_error) =
                         script_environment_metadata(db, output);
                     let environment = ScriptEnvironment::new(
@@ -117,9 +168,55 @@ impl ScriptEnvironments {
                         uv_metadata,
                         initialization_error,
                     );
+
+                    // Mark the initialization as complete/successful
+                    // (dropping would unset the value to `Vacant`).
                     claim.complete(environment);
-                    return;
+                    return EnvironmentReadiness::Ready;
                 }
+            }
+        }
+    }
+
+    /// Returns whether `file`'s first environment synchronization is pending.
+    pub fn is_initialization_pending(&self, db: &dyn Db, file: File) -> bool {
+        if !self.is_enabled() || script_sync_task(db, file).is_none() {
+            return false;
+        }
+
+        self.existing_entry(file)
+            .is_some_and(|entry| entry.state.lock().readiness().is_pending())
+    }
+
+    /// Ensures an unsaved script can continue using its default environment.
+    ///
+    /// The language server calls this after applying an in-memory edit. If the edit first adds a
+    /// script block, uv cannot synchronize it until the document is saved because uv reads the
+    /// script from disk. Creating the default environment prevents existing diagnostics from
+    /// disappearing in the meantime. Saving the document schedules the first synchronization.
+    ///
+    /// This cancels older database snapshots and waits for them to be dropped. A blocking
+    /// initializer must therefore complete or restore its entry to `Vacant` before cancellation
+    /// finishes. If it restores `Vacant`, this caller creates the default environment.
+    pub fn ensure_environment_available(&self, db: &mut dyn Db, file: File) {
+        if !self.is_enabled() || script_sync_task(db, file).is_none() {
+            return;
+        }
+
+        db.trigger_cancellation();
+
+        let entry = self.entry(file);
+        let mut state = entry.state.lock();
+        match &*state {
+            ScriptEnvironmentEntryState::Vacant => {
+                *state = ScriptEnvironmentEntryState::Current {
+                    environment: ScriptEnvironment::new(db, None, None, None),
+                };
+            }
+            ScriptEnvironmentEntryState::Current { .. }
+            | ScriptEnvironmentEntryState::Synchronizing { .. } => {}
+            ScriptEnvironmentEntryState::Initializing { .. } => {
+                panic!("the initializer must finish or unwind before cancellation completes");
             }
         }
     }
@@ -209,7 +306,7 @@ impl ScriptEnvironments {
     }
 
     fn environment(&self, db: &dyn Db, file: File) -> Option<ScriptEnvironment> {
-        if !script_integration_enabled(db) || file.path(db).as_system_path().is_none() {
+        if !self.is_enabled() || file.path(db).as_system_path().is_none() {
             return None;
         }
 
@@ -258,7 +355,7 @@ impl ScriptEnvironments {
         file: File,
         make_progress: &dyn Fn(&dyn Db, File) -> Option<Box<dyn ScriptSyncProgress>>,
     ) -> Option<PendingSync> {
-        if !script_integration_enabled(db) {
+        if !self.is_enabled() {
             return None;
         }
 
@@ -267,19 +364,27 @@ impl ScriptEnvironments {
         let entry: Arc<ScriptEnvironmentEntry> = self.entry(file);
         let mut state = entry.state.lock();
 
-        let environment = match &mut *state {
+        let (environment, readiness) = match &mut *state {
             ScriptEnvironmentEntryState::Initializing { request: running } => {
-                // A blocking check already owns the first synchronization. All inputs to the
-                // cache key belong to its Salsa snapshot, so a different key would require
-                // cancellation of that snapshot before this request can run.
-                debug_assert_eq!(running.cache_key(), request.cache_key());
+                // The blocking initializer holds a database snapshot. Any concurrent caller that
+                // observes `Initializing` therefore reads the same script source and Python
+                // override: changing either requires a database write, which waits for the
+                // initializer's snapshot to unwind before publishing the new revision.
+                assert_eq!(
+                    running.cache_key(),
+                    request.cache_key(),
+                    "concurrent initializations must use the same script environment cache key"
+                );
                 tracing::trace!(
                     "Script environment synchronization for `{}` is already running",
                     request.path()
                 );
                 return None;
             }
-            ScriptEnvironmentEntryState::Vacant => ScriptEnvironment::new(db, None, None, None),
+            ScriptEnvironmentEntryState::Vacant => (
+                ScriptEnvironment::new(db, None, None, None),
+                EnvironmentReadiness::Pending,
+            ),
             ScriptEnvironmentEntryState::Current { environment } => {
                 let already_synchronized =
                     environment.synchronized_cache_key(db) == Some(request.cache_key());
@@ -291,7 +396,8 @@ impl ScriptEnvironments {
                     );
                     return None;
                 }
-                *environment
+
+                (*environment, EnvironmentReadiness::Ready)
             }
             ScriptEnvironmentEntryState::Synchronizing { sync, .. } => {
                 if !sync.replace_queued(request) {
@@ -313,6 +419,7 @@ impl ScriptEnvironments {
         let progress = make_progress(db, file);
         *state = ScriptEnvironmentEntryState::Synchronizing {
             environment,
+            readiness,
             sync: InFlightSync::new(request),
         };
 
@@ -376,6 +483,10 @@ impl ScriptEnvironments {
         SyncCompletion::Applied(file)
     }
 
+    fn is_enabled(&self) -> bool {
+        self.inner.use_uv.script_environments_enabled()
+    }
+
     fn existing_entry(&self, file: File) -> Option<Arc<ScriptEnvironmentEntry>> {
         let entry = self.inner.by_file.get(&file)?;
         Some(Arc::clone(entry.value()))
@@ -395,14 +506,31 @@ impl ScriptEnvironments {
 
 impl std::panic::RefUnwindSafe for ScriptEnvironments {}
 
+/// Whether a script has an environment that can be used for semantic checking.
+#[derive(Clone, Copy)]
+pub(crate) enum EnvironmentReadiness {
+    /// A synchronized or default script environment is available.
+    Ready,
+
+    /// The first synchronization is running and no earlier environment is available.
+    Pending,
+}
+
+impl EnvironmentReadiness {
+    pub(crate) const fn is_pending(self) -> bool {
+        matches!(self, Self::Pending)
+    }
+}
+
 /// The Salsa input that supplies a standalone script's environment.
 #[salsa::input(heap_size=ruff_memory_usage::heap_size)]
 #[derive(Debug)]
 pub(super) struct ScriptEnvironment {
     /// The cache key for the last completed `uv metadata` synchronization.
     ///
-    /// `None` means that no synchronization has completed yet. CLI watch mode creates the input
-    /// with this field unset before scheduling the first synchronization.
+    /// `None` means that no synchronization has completed yet. In the language server, the input
+    /// can still represent the default environment for an unsaved document that just gained a
+    /// script block; otherwise the first synchronization is pending.
     #[returns(copy)]
     synchronized_cache_key: Option<ScriptEnvironmentCacheKey>,
 
@@ -423,6 +551,7 @@ pub(super) struct ScriptEnvironment {
 
 #[derive(Default)]
 struct ScriptEnvironmentsInner {
+    use_uv: UseUv,
     by_file: FxDashMap<File, Arc<ScriptEnvironmentEntry>>,
     sync_service: UvSyncService,
 }
@@ -484,6 +613,8 @@ enum ScriptEnvironmentEntryState {
 
     /// No synchronization is running, and semantic queries use the stored environment input.
     /// A completed blocking or background synchronization transitions the entry to this state.
+    /// The input may instead contain the script's default environment when an unsaved edit first
+    /// adds a script block and uv cannot synchronize the document from disk yet.
     Current {
         /// The environment input read by semantic queries.
         environment: ScriptEnvironment,
@@ -497,12 +628,31 @@ enum ScriptEnvironmentEntryState {
         /// The current environment input, updated in place when synchronization completes.
         environment: ScriptEnvironment,
 
+        /// Whether semantic checking can use `environment` while synchronization runs.
+        ///
+        /// In the language server, the first background synchronization of a saved script is
+        /// pending because no usable environment exists yet, so semantic diagnostics are skipped
+        /// until uv finishes.
+        /// A refresh remains ready and uses the current environment to avoid diagnostics
+        /// disappearing while uv runs. This includes an unsaved file that gained a script block:
+        /// its default environment remains usable when the first synchronization starts on save.
+        readiness: EnvironmentReadiness,
+
         /// The running request and latest queued replacement.
         sync: InFlightSync,
     },
 }
 
 impl ScriptEnvironmentEntryState {
+    fn readiness(&self) -> EnvironmentReadiness {
+        match self {
+            Self::Initializing { .. } => EnvironmentReadiness::Pending,
+            Self::Current { .. } => EnvironmentReadiness::Ready,
+            Self::Synchronizing { readiness, .. } => *readiness,
+            Self::Vacant => EnvironmentReadiness::Ready,
+        }
+    }
+
     fn environment(&self) -> Option<ScriptEnvironment> {
         match self {
             Self::Current { environment } | Self::Synchronizing { environment, .. } => {
@@ -514,7 +664,10 @@ impl ScriptEnvironmentEntryState {
 
     /// Claims a matching result and decides whether to apply or supersede it.
     fn begin_completion(&mut self, request: &ScriptSyncRequest) -> Option<CompletionAction> {
-        let Self::Synchronizing { environment, sync } = self else {
+        let Self::Synchronizing {
+            environment, sync, ..
+        } = self
+        else {
             return None;
         };
         if !sync.is_running(request) {
@@ -534,7 +687,10 @@ impl ScriptEnvironmentEntryState {
 
     /// Marks an applied result as current.
     fn finish_completion(&mut self, request: &ScriptSyncRequest) {
-        let Self::Synchronizing { environment, sync } = self else {
+        let Self::Synchronizing {
+            environment, sync, ..
+        } = self
+        else {
             panic!(
                 "synchronization for `{}` stopped while applying its result",
                 request.path()
@@ -578,6 +734,8 @@ impl InFlightSync {
     /// Records `request` as the desired synchronization.
     ///
     /// Returning to the running request removes a previously queued replacement.
+    /// Returning to the current environment remains queued because the running uv command may
+    /// update that environment before it finishes.
     fn replace_queued(&mut self, request: ScriptSyncRequest) -> bool {
         let desired = self.queued.as_ref().unwrap_or(&self.running);
         if desired.cache_key() == request.cache_key() {
@@ -691,13 +849,6 @@ fn script_environment_metadata(
     }
 }
 
-fn script_integration_enabled(db: &dyn Db) -> bool {
-    matches!(
-        db.system().env_var(EnvVars::TY_UV).as_deref(),
-        Ok("1" | "true" | "scripts")
-    )
-}
-
 fn script_sync_task(db: &dyn Db, file: File) -> Option<ScriptSyncTask> {
     let path = file.path(db).as_system_path()?;
     let tag = script_tag(db, file)?;
@@ -739,14 +890,13 @@ mod tests {
     use ruff_db::files::{File, system_path_to_file};
     use ruff_db::system::{DbWithWritableSystem, SystemPath};
     use salsa::{Cancelled, Database as _};
-    use ty_static::EnvVars;
 
     use super::{
         InitializationClaim, PendingSync, ScriptEnvironmentEntryState, ScriptEnvironments,
         ScriptSyncResult, ScriptSyncTask, SyncCompletion, script_sync_task,
     };
     use crate::db::testing::TestDb;
-    use crate::{Db as _, ProjectMetadata, ScriptSyncProgress};
+    use crate::{Db as _, ProjectMetadata, ScriptSyncProgress, UseUv};
 
     struct NoopScriptSyncProgress;
 
@@ -766,8 +916,8 @@ mod tests {
     fn superseded_synchronization_only_applies_the_latest_cache_key() -> anyhow::Result<()> {
         let root = SystemPath::new("/project").to_path_buf();
         let path = root.join("script.py");
-        let mut db = TestDb::new(ProjectMetadata::new("test", root));
-        db.writable_system().set_env_var(EnvVars::TY_UV, "scripts");
+        let metadata = ProjectMetadata::new("test", root).with_use_uv(UseUv::Scripts);
+        let mut db = TestDb::new(metadata);
         db.write_file(&path, "# /// script\n# dependencies = []\n# ///\n")?;
         let file = system_path_to_file(&db, &path)?;
         let environments: ScriptEnvironments = db.script_environments().clone();
@@ -848,8 +998,8 @@ mod tests {
         let root = SystemPath::new("/project").to_path_buf();
         let path = root.join("script.py");
         let initial_source = "# /// script\n# dependencies = []\n# ///\n";
-        let mut db = TestDb::new(ProjectMetadata::new("test", root));
-        db.writable_system().set_env_var(EnvVars::TY_UV, "scripts");
+        let metadata = ProjectMetadata::new("test", root).with_use_uv(UseUv::Scripts);
+        let mut db = TestDb::new(metadata);
         db.write_file(&path, initial_source)?;
         let file = system_path_to_file(&db, &path)?;
         let environments = db.script_environments().clone();
@@ -906,11 +1056,48 @@ mod tests {
     }
 
     #[test]
+    fn pending_initialization_skips_semantic_checks() -> anyhow::Result<()> {
+        let root = SystemPath::new("/project").to_path_buf();
+        let path = root.join("script.py");
+        let metadata = ProjectMetadata::new("test", root).with_use_uv(UseUv::Scripts);
+        let mut db = TestDb::new(metadata);
+        db.write_file(&path, "# /// script\n# dependencies = []\n# ///\n")?;
+        let file = system_path_to_file(&db, &path)?;
+
+        let environments = db.script_environments().clone();
+        let _task = begin_sync(&environments, &mut db, file)
+            .context("the initial script metadata should be synchronized")?;
+        assert!(!crate::should_check_semantics(&db, file));
+
+        Ok(())
+    }
+
+    #[test]
+    fn default_environment_remains_ready_while_synchronizing() -> anyhow::Result<()> {
+        let root = SystemPath::new("/project").to_path_buf();
+        let path = root.join("script.py");
+        let metadata = ProjectMetadata::new("test", root).with_use_uv(UseUv::Scripts);
+        let mut db = TestDb::new(metadata);
+        db.write_file(&path, "# /// script\n# dependencies = []\n# ///\n")?;
+        let file = system_path_to_file(&db, &path)?;
+        let environments = db.script_environments().clone();
+
+        environments.ensure_environment_available(&mut db, file);
+        assert!(crate::should_check_semantics(&db, file));
+
+        let _task = begin_sync(&environments, &mut db, file)
+            .context("the default environment should be synchronized")?;
+        assert!(crate::should_check_semantics(&db, file));
+
+        Ok(())
+    }
+
+    #[test]
     fn salsa_cancellation_interrupts_script_environment_wait() -> anyhow::Result<()> {
         let root = SystemPath::new("/project").to_path_buf();
         let path = root.join("script.py");
-        let mut db = TestDb::new(ProjectMetadata::new("test", root));
-        db.writable_system().set_env_var(EnvVars::TY_UV, "scripts");
+        let metadata = ProjectMetadata::new("test", root).with_use_uv(UseUv::Scripts);
+        let mut db = TestDb::new(metadata);
         db.write_file(&path, "# /// script\n# dependencies = []\n# ///\n")?;
         let file = system_path_to_file(&db, &path)?;
         let snapshot = db.clone();

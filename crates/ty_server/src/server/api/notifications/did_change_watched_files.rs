@@ -82,6 +82,14 @@ impl SyncNotificationHandler for DidChangeWatchedFiles {
             publish_settings_diagnostics(session, client, root);
         }
 
+        for change in &changes {
+            let ChangeEvent::Changed { path, .. } = change else {
+                continue;
+            };
+
+            session.synchronize_known_script(client, path);
+        }
+
         let client_capabilities = session.client_capabilities();
 
         if client_capabilities.supports_workspace_diagnostic_refresh() {

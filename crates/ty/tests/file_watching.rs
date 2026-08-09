@@ -395,6 +395,14 @@ fn setup<F>(setup_files: F) -> anyhow::Result<TestCase>
 where
     F: Setup,
 {
+    setup_with_system(setup_files, |_| {})
+}
+
+fn setup_with_system<F, C>(setup_files: F, configure_system: C) -> anyhow::Result<TestCase>
+where
+    F: Setup,
+    C: FnOnce(&TestSystem),
+{
     let temp_dir = tempfile::tempdir()?;
 
     let root_path = SystemPath::from_std_path(temp_dir.path()).ok_or_else(|| {
@@ -423,6 +431,7 @@ where
     let user_config_directory_override = os_system.with_user_config_directory(None);
     let system = TestSystem::new(os_system.clone());
     isolate_environment(&system);
+    configure_system(&system);
 
     let mut setup_context = SetupContext {
         system: &os_system,
@@ -2488,25 +2497,23 @@ mod uv_metadata {
     use std::process::Command;
     use std::time::Duration;
 
-    use anyhow::{Context, anyhow};
-    use ruff_db::Db as _;
+    use anyhow::Context;
     use ruff_db::diagnostic::DiagnosticId;
     use ruff_db::files::system_path_to_file;
-    use ruff_db::system::{OsSystem, System as _, TestSystem};
+    use ruff_db::system::{OsSystem, System as _};
     use ty_project::Db;
     use ty_static::EnvVars;
 
-    use super::{TestCase, event_for_file, setup, update_file};
+    use super::{Setup, TestCase, event_for_file, setup_with_system, update_file};
 
     #[test]
     fn unchanged_script_environment_is_reused_after_source_edits() -> anyhow::Result<()> {
         assert_uv_supports_script_metadata()?;
 
-        let mut case = setup([(
+        let mut case = setup_script_uv([(
             "script.py",
             "# /// script\n# dependencies = ['attrs==25.4.0']\n# ///\nfrom attrs import define\n",
         )])?;
-        enable_script_uv(&case)?;
 
         assert!(case.db().check().is_empty());
 
@@ -2524,11 +2531,10 @@ mod uv_metadata {
     fn metadata_changes_resynchronize_the_script_environment() -> anyhow::Result<()> {
         assert_uv_supports_script_metadata()?;
 
-        let mut case = setup([(
+        let mut case = setup_script_uv([(
             "script.py",
             "# /// script\n# dependencies = ['attrs==25.4.0']\n# ///\nfrom attrs import define\n",
         )])?;
-        enable_script_uv(&case)?;
 
         assert!(case.db().check().is_empty());
 
@@ -2547,8 +2553,7 @@ mod uv_metadata {
     fn ordinary_files_becoming_scripts_initialize_their_environments() -> anyhow::Result<()> {
         assert_uv_supports_script_metadata()?;
 
-        let mut case = setup([("script.py", "from attrs import define\n")])?;
-        enable_script_uv(&case)?;
+        let mut case = setup_script_uv([("script.py", "from attrs import define\n")])?;
 
         let ordinary = case.db().check();
         assert!(
@@ -2572,11 +2577,10 @@ mod uv_metadata {
     fn corrected_script_dependencies_replace_initialization_errors() -> anyhow::Result<()> {
         assert_uv_supports_script_metadata()?;
 
-        let mut case = setup([(
+        let mut case = setup_script_uv([(
             "script.py",
             "# /// script\n# dependencies = ['not a valid requirement ???']\n# ///\nvalue = 1\n",
         )])?;
-        enable_script_uv(&case)?;
 
         let initial = case.db().check();
         assert!(
@@ -2614,18 +2618,15 @@ mod uv_metadata {
         Ok(())
     }
 
-    fn enable_script_uv(case: &TestCase) -> anyhow::Result<()> {
-        let system = case
-            .db()
-            .system()
-            .as_any()
-            .downcast_ref::<TestSystem>()
-            .ok_or_else(|| anyhow!("file-watching tests must use TestSystem"))?;
-
-        system.set_env_var(EnvVars::TY_UV, "scripts");
-        system.set_env_var(EnvVars::UV, OsSystem::default().which("uv")?.as_str());
-
-        Ok(())
+    fn setup_script_uv<F>(setup_files: F) -> anyhow::Result<TestCase>
+    where
+        F: Setup,
+    {
+        let uv = OsSystem::default().which("uv")?;
+        setup_with_system(setup_files, move |system| {
+            system.set_env_var(EnvVars::TY_UV, "scripts");
+            system.set_env_var(EnvVars::UV, uv.as_str());
+        })
     }
 
     fn update_and_synchronize_script(case: &mut TestCase, source: &str) -> anyhow::Result<bool> {

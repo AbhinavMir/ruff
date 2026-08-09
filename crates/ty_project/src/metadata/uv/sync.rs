@@ -441,7 +441,7 @@ mod tests {
     use crate::db::testing::TestDb;
     use crate::{
         CollectReporter, Db as _, ProgressReporter, ProjectDatabase, ProjectMetadata,
-        ScriptSyncProgress,
+        ScriptSyncProgress, UseUv,
     };
 
     struct NoopScriptSyncProgress;
@@ -516,8 +516,8 @@ mod tests {
     fn progress_panic_propagates_to_blocking_caller() -> anyhow::Result<()> {
         let root = SystemPath::new("/project").to_path_buf();
         let path = root.join("script.py");
-        let mut db = TestDb::new(ProjectMetadata::new("test", root));
-        db.writable_system().set_env_var(EnvVars::TY_UV, "scripts");
+        let metadata = ProjectMetadata::new("test", root).with_use_uv(UseUv::Scripts);
+        let mut db = TestDb::new(metadata);
         db.write_file(&path, "# /// script\n# dependencies = []\n# ///\n")?;
         let file = system_path_to_file(&db, &path)?;
         let reporter = PanickingProgressReporter;
@@ -541,8 +541,8 @@ mod tests {
     fn database_write_cancels_pending_uv_initialization() -> anyhow::Result<()> {
         let root = SystemPath::new("/project").to_path_buf();
         let path = root.join("script.py");
-        let mut db = TestDb::new(ProjectMetadata::new("test", root));
-        db.writable_system().set_env_var(EnvVars::TY_UV, "scripts");
+        let metadata = ProjectMetadata::new("test", root).with_use_uv(UseUv::Scripts);
+        let mut db = TestDb::new(metadata);
         db.write_file(&path, "# /// script\n# dependencies = []\n# ///\n")?;
         let file = system_path_to_file(&db, &path)?;
         let snapshot = db.clone();
