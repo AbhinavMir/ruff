@@ -1,4 +1,16 @@
 //! Diagnostic baseline loading, matching, and serialization.
+//!
+//! A baseline fingerprint consists of the lint rule and two hashes. The hashes cover up to 100
+//! non-whitespace characters immediately before and starting at the diagnostic's primary range.
+//! A current diagnostic matches an entry for the same project-relative file when the rule and at
+//! least one of the two hashes match. Using context from both sides lets a diagnostic survive an
+//! edit on one side without making the fingerprint insensitive to changes on both sides.
+//!
+//! Matching is one-to-one and order-preserving. Baseline entries and current diagnostics are
+//! compared in deterministic source order, and a baseline entry is consumed after it matches.
+//! This preserves duplicate diagnostics without allowing one baseline entry to hide more than one
+//! current diagnostic. A match changes the diagnostic's severity to [`Severity::Hint`]; consumers
+//! decide whether hints should be displayed.
 
 use std::collections::BTreeMap;
 use std::hash::Hasher;
@@ -30,6 +42,7 @@ struct Baseline {
 )]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct BaselineEntry {
+    /// Used to sort generated entries; baseline files preserve their serialized array order.
     #[serde(skip)]
     offset: TextSize,
     rule: String,
