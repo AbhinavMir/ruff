@@ -12,6 +12,7 @@ pub use db::testing::TestDb;
 pub use db::{ChangeResult, CheckMode, Db, ProjectDatabase, SalsaMemoryDump};
 use files::{Index, Indexed, IndexedFiles};
 
+pub use metadata::script::ScriptEnvironments;
 use metadata::settings::Settings;
 pub use metadata::{ProjectMetadata, ProjectMetadataError};
 use rayon::prelude::*;
@@ -136,6 +137,13 @@ pub trait ProgressReporter: Send + Sync {
     /// Initialize the reporter with the number of files.
     fn set_files(&mut self, files: usize);
 
+    /// Creates an owned progress guard for synchronizing `file`'s standalone-script environment.
+    ///
+    /// Returns `None` when synchronization progress should not be displayed.
+    fn for_script(&self, _db: &dyn Db, _file: File) -> Option<Box<dyn ScriptSyncProgress>> {
+        None
+    }
+
     /// Report the completion of checking a given file along with its diagnostics.
     fn report_checked_file(&self, db: &ProjectDatabase, file: File, diagnostics: &[Diagnostic]);
 
@@ -144,6 +152,14 @@ pub trait ProgressReporter: Send + Sync {
     /// But it's never a file for which [`Self::report_checked_file`] gets called.
     fn report_diagnostics(&mut self, db: &ProjectDatabase, diagnostics: Vec<Diagnostic>);
 }
+
+/// An owned progress guard for synchronizing a standalone script's environment.
+///
+/// Creating the guard starts progress reporting and dropping it finishes progress reporting. A
+/// background synchronization may move the guard between threads and outlive the operation that
+/// scheduled it. Implementations must not retain a database because doing so could keep a cancelled
+/// database snapshot alive until synchronization finishes.
+pub trait ScriptSyncProgress: Send {}
 
 /// Reporter that collects all diagnostics into a `Vec`.
 #[derive(Default)]
@@ -371,6 +387,7 @@ impl Project {
 
         reporter.report_diagnostics(db, diagnostics);
 
+        let reporter: &dyn ProgressReporter = reporter;
         let open_files = self.open_files(db);
         let check_start = ruff_db::Instant::now();
 
@@ -384,6 +401,8 @@ impl Project {
                 let check_file_span =
                     tracing::debug_span!(parent: &project_span, "check_file", ?file);
                 let _entered = check_file_span.entered();
+                db.script_environments()
+                    .ensure_environment_initialized(db, file, reporter);
                 let program_file = db.program_file(file);
 
                 match check_file_impl(db, program_file) {
