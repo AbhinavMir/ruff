@@ -869,7 +869,7 @@ fn specialize_narrowing_target_from_intersection<'db>(
         db,
         env,
         &constraints,
-        generic_context.inferable_typevars(db),
+        generic_context.inferable_typevars_with_bound_dependencies(db),
     );
     let specialized_class =
         specialize_generic_class_from_solutions(db, env, target_class, solutions)?;
@@ -984,7 +984,7 @@ fn specialize_generic_class_for_subject<'db>(
             db,
             env,
             Type::instance(db, env, target),
-            generic_context.inferable_typevars(db),
+            generic_context.inferable_typevars_with_bound_dependencies(db),
         )
         .solve(db, env, &constraints);
 
@@ -2364,7 +2364,7 @@ impl<'db> PatternSuccessAnalyzer<'db> {
                 db,
                 &self.env,
                 Type::instance(db, &self.env, subject_class),
-                generic_context.inferable_typevars(db),
+                generic_context.inferable_typevars_with_bound_dependencies(db),
             )
             .solve_with(|variance, path_bound| {
                 let Some(lower) = path_bound.lower else {

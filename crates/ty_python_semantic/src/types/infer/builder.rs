@@ -5459,7 +5459,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 let inferable = overload
                     .signature
                     .generic_context
-                    .map(|generic_context| generic_context.inferable_typevars(db))
+                    .map(|generic_context| {
+                        generic_context.inferable_typevars_with_bound_dependencies(db)
+                    })
                     .unwrap_or(TypeVarSet::None);
 
                 !overload
@@ -6466,7 +6468,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             );
             CallableType::new(db, signatures, callable.kind(db), callable.provenance(db))
         });
-        let inferable = class_generic_context.inferable_typevars(db);
+        let inferable = class_generic_context.inferable_typevars_with_bound_dependencies(db);
         let constraints = ConstraintSetBuilder::new();
         let path_bounds = source_callable
             .into_type(db, env)
@@ -6783,7 +6785,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             let inferable = KnownClass::Tuple
                 .try_to_class_literal(db, env)
                 .and_then(|class| class.generic_context(db))
-                .map(|generic_context| generic_context.inferable_typevars(db))
+                .map(|generic_context| {
+                    generic_context.inferable_typevars_with_bound_dependencies(db)
+                })
                 .unwrap_or(TypeVarSet::None);
             annotation.filter_disjoint_elements(
                 db,
@@ -7220,9 +7224,14 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         };
 
         let constraints = ConstraintSetBuilder::new();
-        let inferable = generic_context.inferable_typevars(db);
+        let inferable = generic_context.inferable_typevars_with_bound_dependencies(db);
         let identity_instance = Type::instance(db, env, ClassType::Generic(collection_alias));
-        let mut builder = SpecializationBuilder::new(db, env, &constraints, inferable);
+        let mut builder = SpecializationBuilder::new_with_bound_dependencies(
+            db,
+            env,
+            &constraints,
+            generic_context,
+        );
 
         // Remove any union elements of that are unrelated to the collection type.
         //
@@ -7642,7 +7651,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let class_type = collection_alias
             .origin(self.db())
             .apply_specialization(db, |_| {
-                builder.build_with(generic_context, |current_typevar, bounds| {
+                builder.build_with(|current_typevar, bounds| {
                     let lower = bounds?.lower?;
 
                     let lower = if is_empty_collection_type_context(tcx) {
@@ -7725,7 +7734,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             db,
             env,
             annotation,
-            generic_context.inferable_typevars(db),
+            generic_context.inferable_typevars_with_bound_dependencies(db),
         );
         let constraints = ConstraintSetBuilder::new();
         let Solutions::Constrained(solutions) = path_bounds.solve(db, env, &constraints) else {
