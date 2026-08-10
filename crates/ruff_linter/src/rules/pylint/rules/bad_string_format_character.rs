@@ -27,7 +27,7 @@ use crate::checkers::ast::Checker;
 /// print("{:z}".format("1"))
 /// ```
 #[derive(ViolationMetadata)]
-#[violation_metadata(stable_since = "v0.0.283")]
+#[violation_metadata(stable_since = "v0.0.283", category = "correctness")]
 pub(crate) struct BadStringFormatCharacter {
     format_char: char,
 }

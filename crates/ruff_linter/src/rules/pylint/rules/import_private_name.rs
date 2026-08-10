@@ -51,7 +51,7 @@ use crate::package::PackageRoot;
 /// [PEP 8]: https://peps.python.org/pep-0008/
 /// [PEP 420]: https://peps.python.org/pep-0420/
 #[derive(ViolationMetadata)]
-#[violation_metadata(preview_since = "v0.1.14")]
+#[violation_metadata(preview_since = "v0.1.14", category = "pedantic")]
 pub(crate) struct ImportPrivateName {
     name: String,
     module: Option<String>,
