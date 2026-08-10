@@ -7,7 +7,8 @@ Example usage:
         --name PreferListBuiltin \
         --prefix PIE \
         --code 807 \
-        --linter flake8-pie
+        --linter flake8-pie \
+        --category pedantic
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from pathlib import Path
 from _utils import ROOT_DIR, dir_name, get_indent, pascal_case, snake_case
 
 
-def main(*, name: str, prefix: str, code: str, linter: str) -> None:
+def main(*, name: str, prefix: str, code: str, linter: str, category: str) -> None:
     """Generate boilerplate for a new rule."""
     # Create a test fixture.
     filestem = f"{prefix}{code}" if linter != "pylint" else snake_case(name)
@@ -110,7 +111,7 @@ use crate::checkers::ast::Checker;
 /// ```python
 /// ```
 #[derive(ViolationMetadata)]
-#[violation_metadata(preview_since = "NEXT_RUFF_VERSION")]
+#[violation_metadata(preview_since = "NEXT_RUFF_VERSION", category = "{category}")]
 pub(crate) struct {name};
 
 impl Violation for {name} {{
@@ -163,7 +164,8 @@ if __name__ == "__main__":
         description="Generate boilerplate for a new rule.",
         epilog=(
             "python scripts/add_rule.py "
-            "--name PreferListBuiltin --code PIE807 --linter flake8-pie"
+            "--name PreferListBuiltin --code PIE807 --linter flake8-pie "
+            "--category pedantic"
         ),
     )
     parser.add_argument(
@@ -193,6 +195,28 @@ if __name__ == "__main__":
         required=True,
         help="The source with which the check originated (e.g., 'flake8-pie').",
     )
+    parser.add_argument(
+        "--category",
+        choices=(
+            "correctness",
+            "suspicious",
+            "complexity",
+            "perf",
+            "style",
+            "security",
+            "formatting",
+            "pedantic",
+            "restriction",
+        ),
+        required=True,
+        help="The semantic category for the rule.",
+    )
     args = parser.parse_args()
 
-    main(name=args.name, prefix=args.prefix, code=args.code, linter=args.linter)
+    main(
+        name=args.name,
+        prefix=args.prefix,
+        code=args.code,
+        linter=args.linter,
+        category=args.category,
+    )

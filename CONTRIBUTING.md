@@ -209,9 +209,9 @@ At a high level, the steps involved in adding a new lint rule are as follows:
 
 1. In that file, define a violation struct (e.g., `pub struct AssertFalse`). You can grep for
     `#[derive(ViolationMetadata)]` to see examples. You also need to add a
-    `#[violation_metadata(preview_since = "NEXT_RUFF_VERSION")]` attribute on your
-    `ViolationMetadata` struct. This adds the rule in preview, and the version will be filled in
-    automatically in the next release.
+    `#[violation_metadata(preview_since = "NEXT_RUFF_VERSION", category = "pedantic")]` attribute
+    on your `ViolationMetadata` struct. This assigns the rule to a semantic category and adds it in
+    preview. The version will be filled in automatically in the next release.
 
 1. In that file, define a function that adds the violation to the diagnostic list as appropriate
     (e.g., `pub(crate) fn assert_false`) based on whatever inputs are required for the rule (e.g.,

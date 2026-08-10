@@ -8,12 +8,23 @@ use syn::{Attribute, DeriveInput, Error, Lit, LitStr, Meta, meta::ParseNestedMet
 pub(crate) fn violation_metadata(input: DeriveInput) -> syn::Result<TokenStream> {
     let docs = get_docs(&input.attrs)?;
 
-    let Some(group) = get_rule_status(&input.attrs)? else {
+    let metadata = get_metadata(&input.attrs)?;
+
+    let Some(group) = metadata.group else {
         return Err(Error::new_spanned(
-            input,
+            &input,
             "Missing required rule group metadata",
         ));
     };
+
+    if metadata.category.is_none() && !metadata.removed {
+        return Err(Error::new_spanned(
+            &input,
+            "Missing required rule category metadata",
+        ));
+    }
+
+    let category = metadata.category.unwrap_or_else(|| quote!(None));
 
     let name = input.ident;
 
@@ -33,6 +44,10 @@ pub(crate) fn violation_metadata(input: DeriveInput) -> syn::Result<TokenStream>
 
             fn group() -> crate::codes::RuleGroup {
                 crate::codes::#group
+            }
+
+            fn category() -> Option<crate::codes::Category> {
+                #category
             }
 
             fn file() -> &'static str {
@@ -65,37 +80,59 @@ fn get_docs(attrs: &[Attribute]) -> syn::Result<String> {
     Ok(explanation)
 }
 
-/// Extract the rule status attribute.
+/// Extract the rule metadata attributes.
 ///
 /// These attributes look like:
 ///
 /// ```ignore
-/// #[violation_metadata(stable_since = "1.2.3")]
+/// #[violation_metadata(stable_since = "1.2.3", category = "correctness")]
 /// struct MyRule;
 /// ```
 ///
-/// The result is returned as a `TokenStream` so that the version string literal can be combined
-/// with the proper `RuleGroup` variant, e.g. `RuleGroup::Stable` for `stable_since` above.
-fn get_rule_status(attrs: &[Attribute]) -> syn::Result<Option<TokenStream>> {
-    let mut group = None;
+/// The rule group is stored as a `TokenStream` so that the version string literal can be combined
+/// with the proper variant, e.g. `RuleGroup::Stable` for `stable_since` above.
+fn get_metadata(attrs: &[Attribute]) -> syn::Result<Metadata> {
+    let mut metadata = Metadata::default();
     for attr in attrs {
         if attr.path().is_ident("violation_metadata") {
             attr.parse_nested_meta(|meta| {
                 if meta.path.is_ident("stable_since") {
                     let lit: LitStr = parse_version(&meta)?;
-                    group = Some(quote!(RuleGroup::Stable { since: #lit }));
+                    metadata.group = Some(quote!(RuleGroup::Stable { since: #lit }));
                     return Ok(());
                 } else if meta.path.is_ident("preview_since") {
                     let lit: LitStr = parse_version(&meta)?;
-                    group = Some(quote!(RuleGroup::Preview { since: #lit }));
+                    metadata.group = Some(quote!(RuleGroup::Preview { since: #lit }));
                     return Ok(());
                 } else if meta.path.is_ident("deprecated_since") {
                     let lit: LitStr = parse_version(&meta)?;
-                    group = Some(quote!(RuleGroup::Deprecated { since: #lit }));
+                    metadata.group = Some(quote!(RuleGroup::Deprecated { since: #lit }));
                     return Ok(());
                 } else if meta.path.is_ident("removed_since") {
                     let lit: LitStr = parse_version(&meta)?;
-                    group = Some(quote!(RuleGroup::Removed { since: #lit }));
+                    metadata.group = Some(quote!(RuleGroup::Removed { since: #lit }));
+                    metadata.removed = true;
+                    return Ok(());
+                } else if meta.path.is_ident("category") {
+                    let lit: LitStr = meta.value()?.parse()?;
+                    metadata.category = Some(match lit.value().as_str() {
+                        "correctness" => quote!(Some(crate::codes::Category::Correctness)),
+                        "suspicious" => quote!(Some(crate::codes::Category::Suspicious)),
+                        "complexity" => quote!(Some(crate::codes::Category::Complexity)),
+                        "perf" => quote!(Some(crate::codes::Category::Perf)),
+                        "style" => quote!(Some(crate::codes::Category::Style)),
+                        "security" => quote!(Some(crate::codes::Category::Security)),
+                        "formatting" => quote!(Some(crate::codes::Category::Formatting)),
+                        "pedantic" => quote!(Some(crate::codes::Category::Pedantic)),
+                        "restriction" => quote!(Some(crate::codes::Category::Restriction)),
+                        "test" => quote!(None),
+                        category => {
+                            return Err(Error::new_spanned(
+                                lit,
+                                format_args!("Unknown rule category `{category}`"),
+                            ));
+                        }
+                    });
                     return Ok(());
                 }
                 Err(Error::new_spanned(
@@ -105,7 +142,14 @@ fn get_rule_status(attrs: &[Attribute]) -> syn::Result<Option<TokenStream>> {
             })?;
         }
     }
-    Ok(group)
+    Ok(metadata)
+}
+
+#[derive(Default)]
+struct Metadata {
+    group: Option<TokenStream>,
+    category: Option<TokenStream>,
+    removed: bool,
 }
 
 fn parse_attr<'a, const LEN: usize>(
