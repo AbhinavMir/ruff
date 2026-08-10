@@ -2471,8 +2471,8 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
     /// Build a specialization, using a caller-provided hook to select the solution for each
     /// typevar.
     ///
-    /// The `choose` hook is called for each typevar on the generic context with the typevar's
-    /// explicit lower and upper bounds.
+    /// The `choose` hook is called for each typevar on the generic context with the complete path
+    /// family and the typevar's explicit lower and upper bounds.
     /// Unmapped typevars receive `None` for their bounds and fall back to their default
     /// specialization if an alternative default type is not chosen.
     ///
@@ -2481,7 +2481,10 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
     pub(crate) fn build_with(
         &mut self,
         generic_context: GenericContext<'db>,
-        mut choose: impl FnMut(BoundTypeVarInstance<'db>, Option<&PathBound<'db>>) -> Option<Type<'db>>,
+        mut choose: impl FnMut(
+            BoundTypeVarInstance<'db>,
+            Option<(&PathBounds<'db>, &PathBound<'db>)>,
+        ) -> Option<Type<'db>>,
     ) -> Specialization<'db> {
         let db = self.db;
         let types = self
@@ -2509,7 +2512,9 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         generic_context: GenericContext<'db>,
         mut choose: impl FnMut(BoundTypeVarInstance<'db>, Option<&PathBound<'db>>) -> Option<Type<'db>>,
     ) -> Result<TypeVarInference<'db>, ()> {
-        let types = self.solve_pending_with(generic_context, &mut choose)?;
+        let types = self.solve_pending_with(generic_context, &mut |typevar, context| {
+            choose(typevar, context.map(|(_, path_bound)| path_bound))
+        })?;
         Ok(self.typevar_inference(generic_context, &types))
     }
 
@@ -2531,7 +2536,9 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
             let _ = self.add_type_mappings_from_constraint_set(when);
         }
 
-        let types = self.solve_hash_map_with(generic_context, &mut choose);
+        let types = self.solve_hash_map_with(generic_context, &mut |typevar, context| {
+            choose(typevar, context.map(|(_, path_bound)| path_bound))
+        });
         self.typevar_inference(generic_context, &types)
     }
 
@@ -2553,7 +2560,10 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
     fn solve_pending_with(
         &mut self,
         generic_context: GenericContext<'db>,
-        choose: &mut impl FnMut(BoundTypeVarInstance<'db>, Option<&PathBound<'db>>) -> Option<Type<'db>>,
+        choose: &mut impl FnMut(
+            BoundTypeVarInstance<'db>,
+            Option<(&PathBounds<'db>, &PathBound<'db>)>,
+        ) -> Option<Type<'db>>,
     ) -> Result<FxHashMap<BoundTypeVarIdentity<'db>, Type<'db>>, ()> {
         let db = self.db;
         // TODO: Move `ParamSpec` and `TypeVarTuple` handling to the new constraint solver.
@@ -2577,20 +2587,18 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         // was not enough: `solutions_with` still performed the expensive path traversal, and the
         // skipped projection changed precision in LiteralString tests. See the
         // `ty_micro[pydantic_core_schema_dict]` benchmark for a minimized reproducer.
-        let solutions = match self.pending.pruned_solutions_with(
-            db,
-            self.env,
-            self.constraints,
-            self.inferable,
-            |_variance, path_bound| {
-                let typevar = path_bound.bound_typevar;
-                if let Some(ty) = choose(typevar, Some(path_bound)) {
-                    return Ok(Some(ty));
-                }
+        let mut path_bounds =
+            self.pending
+                .path_bounds(db, self.env, self.constraints, self.inferable);
+        path_bounds.prune_subsumed(db, self.env);
+        let solutions = match path_bounds.solve_with(|path_bounds, _variance, path_bound| {
+            let typevar = path_bound.bound_typevar;
+            if let Some(ty) = choose(typevar, Some((path_bounds, path_bound))) {
+                return Ok(Some(ty));
+            }
 
-                PathBounds::default_solve(db, self.env, self.constraints, path_bound)
-            },
-        ) {
+            path_bounds.default_solve(db, self.env, self.constraints, path_bound)
+        }) {
             Solutions::Unsatisfiable => return Err(()),
             Solutions::Unconstrained => {
                 return Ok(self.solve_hash_map_with(generic_context, choose));
@@ -2780,7 +2788,10 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
     fn solve_hash_map_with(
         &mut self,
         generic_context: GenericContext<'db>,
-        choose: &mut impl FnMut(BoundTypeVarInstance<'db>, Option<&PathBound<'db>>) -> Option<Type<'db>>,
+        choose: &mut impl FnMut(
+            BoundTypeVarInstance<'db>,
+            Option<(&PathBounds<'db>, &PathBound<'db>)>,
+        ) -> Option<Type<'db>>,
     ) -> FxHashMap<BoundTypeVarIdentity<'db>, Type<'db>> {
         let db = self.db;
         generic_context
@@ -2794,7 +2805,8 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                 let chosen = match mapped_ty {
                     Some(mapped_ty) => {
                         let path_bound = PathBound::exact(*variable, mapped_ty);
-                        choose(*variable, Some(&path_bound)).unwrap_or(mapped_ty)
+                        let path_bounds = PathBounds::from_legacy_path_bound(path_bound.clone());
+                        choose(*variable, Some((&path_bounds, &path_bound))).unwrap_or(mapped_ty)
                     }
                     None => choose(*variable, None)?,
                 };
@@ -2941,15 +2953,11 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         set: ConstraintSet<'db, 'c>,
     ) -> Result<(), ConstraintSetInferenceError<'db>> {
         let db = self.db;
-        let solutions = match set.pruned_solutions_with(
-            db,
-            self.env,
-            self.constraints,
-            self.inferable,
-            |_variance, path_bound| {
-                PathBounds::default_solve(db, self.env, self.constraints, path_bound)
-            },
-        ) {
+        let mut path_bounds = set.path_bounds(db, self.env, self.constraints, self.inferable);
+        path_bounds.prune_subsumed(db, self.env);
+        let solutions = match path_bounds.solve_with(|path_bounds, _variance, path_bound| {
+            path_bounds.default_solve(db, self.env, self.constraints, path_bound)
+        }) {
             Solutions::Unsatisfiable => {
                 let error = match set.unconjoined_path_bounds(
                     db,
@@ -2957,7 +2965,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                     self.constraints,
                     self.inferable,
                 ) {
-                    PathBounds::Constrained(paths) => {
+                    PathBounds::Constrained { paths, .. } => {
                         paths.iter().flatten().find_map(|path_bound| {
                             self.specialization_error_from_failed_bounds(path_bound)
                         })

@@ -52,7 +52,7 @@ use crate::types::callable::{CallableFunctionProvenance, CallableTypeKind};
 use crate::types::class::{
     ClassLiteral, CodeGeneratorKind, FrozenDataclassDispatch, MethodDecorator,
 };
-use crate::types::constraints::{ConstraintSetBuilder, PathBounds, Solutions};
+use crate::types::constraints::{ConstraintSetBuilder, Solutions};
 use crate::types::context::InferContext;
 use crate::types::dedicated::pydantic;
 use crate::types::diagnostic::{
@@ -7286,13 +7286,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                 let path_bounds =
                     identity_instance.assignable_solutions_with_inferable(db, env, tcx, inferable);
-                let solutions = path_bounds.solve_with(|variance, path_bound| {
+                let solutions = path_bounds.solve_with(|path_bounds, variance, path_bound| {
                     let identity = path_bound.bound_typevar.identity(db);
                     elt_tcx_variance
                         .entry(identity)
                         .and_modify(|current| *current = current.join(variance))
                         .or_insert(variance);
-                    PathBounds::default_solve(db, env, &constraints, path_bound)
+                    path_bounds.default_solve(db, env, &constraints, path_bound)
                 });
 
                 match solutions {
@@ -7642,8 +7642,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let class_type = collection_alias
             .origin(self.db())
             .apply_specialization(db, |_| {
-                builder.build_with(generic_context, |current_typevar, bounds| {
-                    let lower = bounds?.evidence_lower?;
+                builder.build_with(generic_context, |current_typevar, context| {
+                    let (_, bounds) = context?;
+                    let lower = bounds.evidence_lower?;
 
                     let lower = if is_empty_collection_type_context(tcx) {
                         // Constraints learned from later collection uses follow the same promotion

@@ -33,9 +33,7 @@ use crate::subscript::PyIndex;
 use crate::types::ProgramEnvironment;
 use crate::types::call::arguments::{CallArgumentTypes, Expansion, is_expandable_type};
 use crate::types::callable::CallableTypeKind;
-use crate::types::constraints::{
-    ConstraintSet, ConstraintSetBuilder, PathBound, PathBounds, Solutions,
-};
+use crate::types::constraints::{ConstraintSet, ConstraintSetBuilder, PathBound, Solutions};
 use crate::types::context::LintDiagnosticGuardBuilder;
 use crate::types::dedicated::pydantic::{self, ConfigBoolean};
 use crate::types::diagnostic::{
@@ -5606,13 +5604,13 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                 // lower/upper bounds on each BDD path.
                 let mut variance_map: FxHashMap<BoundTypeVarIdentity<'_>, TypeVarVariance> =
                     FxHashMap::default();
-                let solutions = path_bounds.solve_with(|variance, path_bound| {
+                let solutions = path_bounds.solve_with(|path_bounds, variance, path_bound| {
                     let identity = path_bound.bound_typevar.identity(db);
                     variance_map
                         .entry(identity)
                         .and_modify(|current| *current = current.join(variance))
                         .or_insert(variance);
-                    PathBounds::default_solve(db, self.env, constraints, path_bound)
+                    path_bounds.default_solve(db, self.env, constraints, path_bound)
                 });
 
                 let Solutions::Constrained(solutions) = solutions else {
