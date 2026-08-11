@@ -1238,6 +1238,91 @@ fn rule_name_selector_cli_preview_enabled() -> Result<()> {
 }
 
 #[test]
+fn rule_category_selector_cli_preview_disabled() -> Result<()> {
+    let fixture = unknown_rule_selector_test()?;
+
+    assert_cmd_snapshot!(fixture.check_command().args(["--select", "restriction"]), @"
+    success: false
+    exit_code: 2
+    ----- stdout -----
+
+    ----- stderr -----
+    ruff failed
+      Cause: Invalid selector `restriction` in `select` from the CLI. Selecting rules by category requires preview mode
+    ");
+
+    Ok(())
+}
+
+#[test]
+fn rule_category_selector_cli_preview_enabled() -> Result<()> {
+    let fixture = CliTest::with_file("test.py", "assert True")?;
+
+    assert_cmd_snapshot!(fixture.check_command().args(["--select", "restriction", "--preview"]), @"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+    test.py:1:1: assert: Use of `assert` detected
+    Found 1 error.
+
+    ----- stderr -----
+    ");
+
+    Ok(())
+}
+
+// TODO(brent) this test shouldn't exist. Codex added this to point out that
+// `PREVIEW_DEFAULT_SELECTORS` actually differs from `DEFAULT_SELECTORS` in a couple of additional
+// ways. First, it includes preview rules, which have now been assigned categories but were
+// previously excluded from the default rules work. Second, and worse, the categorization metadata
+// differs slightly from the categorization used in `DEFAULT_SELECTORS`, including 55 changes to the
+// default rules. This includes 7 DTZ removals that were intentional based on feedback but probably
+// still shouldn't sneak into this PR:
+//
+// ```
+// DTZ001 DTZ005 DTZ006 DTZ007 DTZ011 DTZ012 DTZ901
+// ```
+//
+// and these newly enabled rules, most of which were previously third-party, but some of which are
+// just changes:
+//
+// ```
+// complexity:  FURB110 FURB171 PT008 RUF037 SIM110
+// correctness: DJ013 F406 FAST001 FAST003 NPY001 PLE0241 PT024 RUF060
+//              RUF102 RUF103
+// perf:        PLC0207
+// style:       AIR001 D301 DJ001 DJ006 DJ007 DJ008 DJ012 FAST002 PD003
+//              PD004 PD012 PD015 RUF061
+// suspicious:  AIR002 AIR301 AIR302 AIR303 AIR311 AIR312 ASYNC212
+//              ASYNC240 ASYNC250 NPY002 NPY003 NPY201 PLW0108 PT012
+//              PT028 RUF064 RUF104 S307 UP042
+// ```
+//
+// 28 of these were previously third-party and so otherwise expected additions but also shouldn't be
+// included here. The remaining 20 are "unexpected" and warrant further exploration before making
+// the changes here or otherwise.
+//
+// On second thought, it might end up being okay to include these changes here as intentional
+// preview changes to the default rules, but we do need to verify the category assignments first.
+#[test]
+fn preview_default_rules_use_categories() -> Result<()> {
+    let fixture = CliTest::with_file("test.py", "if True:\n    pass\nassert True\n")?;
+
+    assert_cmd_snapshot!(fixture.check_command().arg("--preview"), @"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+    test.py:1:1: unnecessary-if: [*] Empty `if` statement
+    Found 1 error.
+    [*] 1 fixable with the `--fix` option.
+
+    ----- stderr -----
+    ");
+
+    Ok(())
+}
+
+#[test]
 fn rule_name_selector_config_preview_disabled() -> Result<()> {
     let fixture = unknown_rule_selector_test()?;
     fixture.write_file("ruff.toml", r#"lint = { select = ["unused-import"] }"#)?;

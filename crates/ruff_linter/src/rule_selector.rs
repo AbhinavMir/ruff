@@ -7,9 +7,8 @@ use strum_macros::EnumIter;
 
 use ruff_ranged_value::{RangedValue, ValueSource};
 
-use crate::codes::RuleIter;
-use crate::codes::{RuleCodePrefix, RuleGroup};
-use crate::preview::is_human_readable_names_enabled;
+use crate::codes::{Category, RuleCodePrefix, RuleGroup, RuleIter};
+use crate::preview::{is_human_readable_names_enabled, is_rule_categories_enabled};
 use crate::registry::{Linter, Rule, RuleNamespace};
 use crate::rule_redirects::get_redirect;
 use crate::settings::types::PreviewMode;
@@ -25,13 +24,20 @@ pub struct UnresolvedRuleSelector(RangedValue<String>);
 
 impl UnresolvedRuleSelector {
     pub fn resolve(&self, preview: PreviewMode) -> Result<RuleSelector, RuleResolutionError> {
-        RuleSelector::from_str(self.0.as_str()).or_else(|_| {
-            let kind = if let Ok(rule) = Rule::from_name(self.0.as_str()) {
+        let selector = self.0.as_str();
+
+        RuleSelector::from_str(selector).or_else(|_| {
+            let kind = if let Ok(category) = Category::from_str(selector) {
+                if is_rule_categories_enabled(preview) {
+                    return Ok(RuleSelector::Category(category));
+                }
+                RuleResolutionErrorKind::PreviewCategory
+            } else if let Ok(rule) = Rule::from_name(selector) {
                 if is_human_readable_names_enabled(preview) {
                     return Ok(RuleSelector::rule(rule));
                 }
                 RuleResolutionErrorKind::PreviewName
-            } else if matches!(self.0.as_str(), "PREVIEW" | "NURSERY") {
+            } else if matches!(selector, "PREVIEW" | "NURSERY") {
                 RuleResolutionErrorKind::Removed
             } else {
                 RuleResolutionErrorKind::Unknown
@@ -57,6 +63,7 @@ impl UnresolvedRuleSelector {
 enum RuleResolutionErrorKind {
     Removed,
     Unknown,
+    PreviewCategory,
     PreviewName,
 }
 
@@ -116,6 +123,11 @@ impl std::fmt::Display for RuleResolutionError {
                 f,
                 "Unknown rule selector `{selector}`{setting} from {source}"
             ),
+            RuleResolutionErrorKind::PreviewCategory => write!(
+                f,
+                "Invalid selector `{selector}`{setting} from {source}. \
+                    Selecting rules by category requires preview mode"
+            ),
             RuleResolutionErrorKind::PreviewName => write!(
                 f,
                 "Invalid selector `{selector}`{setting} from {source}. \
@@ -131,6 +143,8 @@ impl std::error::Error for RuleResolutionError {}
 pub enum RuleSelector {
     /// Select all rules (includes rules in preview if enabled)
     All,
+    /// Select all rules in a semantic category.
+    Category(Category),
     /// Legacy category to select both the `mccabe` and `flake8-comprehensions` linters
     /// via a single selector.
     C,
@@ -244,6 +258,7 @@ impl RuleSelector {
     pub fn prefix_and_code(&self) -> (&'static str, &'static str) {
         match self {
             RuleSelector::All => ("", "ALL"),
+            RuleSelector::Category(category) => ("", category.into_str()),
             RuleSelector::C => ("", "C"),
             RuleSelector::T => ("", "T"),
             RuleSelector::Prefix { prefix, .. } => {
@@ -260,6 +275,10 @@ impl RuleSelector {
     pub fn all_rules(&self) -> impl Iterator<Item = Rule> + use<> {
         match self {
             RuleSelector::All => RuleSelectorIter::All(Rule::iter()),
+            RuleSelector::Category(category) => RuleSelectorIter::Category {
+                iter: Rule::iter(),
+                category: *category,
+            },
 
             RuleSelector::C => RuleSelectorIter::Chain(
                 Linter::Flake8Comprehensions
@@ -306,6 +325,7 @@ impl RuleSelector {
 
 pub enum RuleSelectorIter {
     All(RuleIter),
+    Category { iter: RuleIter, category: Category },
     Chain(std::iter::Chain<std::vec::IntoIter<Rule>, std::vec::IntoIter<Rule>>),
     Vec(std::vec::IntoIter<Rule>),
     Once(std::iter::Once<Rule>),
@@ -317,6 +337,9 @@ impl Iterator for RuleSelectorIter {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             RuleSelectorIter::All(iter) => iter.next(),
+            RuleSelectorIter::Category { iter, category } => {
+                iter.find(|rule| rule.category() == Some(*category))
+            }
             RuleSelectorIter::Chain(iter) => iter.next(),
             RuleSelectorIter::Vec(iter) => iter.next(),
             RuleSelectorIter::Once(iter) => iter.next(),
@@ -339,7 +362,7 @@ mod schema {
     use serde_json::Value;
     use strum::IntoEnumIterator;
 
-    use crate::codes::Rule;
+    use crate::codes::{Category, Rule};
     use crate::registry::RuleNamespace;
     use crate::rule_selector::{Linter, RuleCodePrefix};
     use crate::{RuleSelector, UnresolvedRuleSelector};
@@ -362,6 +385,7 @@ mod schema {
                 "T2".to_string(),
             ]
             .into_iter()
+            .chain(Category::iter().map(|category| category.to_string()))
             .chain(
                 RuleCodePrefix::iter()
                     .map(|p| {
@@ -418,6 +442,7 @@ impl RuleSelector {
     pub fn specificity(&self) -> Specificity {
         match self {
             RuleSelector::All => Specificity::All,
+            RuleSelector::Category(..) => Specificity::Linter,
             RuleSelector::T => Specificity::LinterGroup,
             RuleSelector::C => Specificity::LinterGroup,
             RuleSelector::Linter(..) => Specificity::Linter,
@@ -478,7 +503,8 @@ pub enum Specificity {
     All,
     /// The specificity when selecting a legacy linter group (e.g., `--select C` or `--select T`).
     LinterGroup,
-    /// The specificity when selecting a linter (e.g., `--select PLE` or `--select UP`).
+    /// The specificity when selecting a category or linter (e.g., `--select pedantic` or
+    /// `--select UP`).
     Linter,
     /// The specificity when selecting via a rule prefix with a one-character code (e.g., `--select PLE1`).
     Prefix1Char,
@@ -498,7 +524,7 @@ pub mod clap_completion {
     use strum::IntoEnumIterator;
 
     use crate::{
-        codes::{Rule, RuleCodePrefix},
+        codes::{Category, Rule, RuleCodePrefix},
         registry::{Linter, RuleNamespace},
         rule_selector::UnresolvedRuleSelector,
     };
@@ -561,6 +587,10 @@ pub mod clap_completion {
                         .chain(Rule::iter().map(|rule| {
                             PossibleValue::new(rule.name().as_str())
                                 .help(rule.noqa_code().to_string())
+                        }))
+                        .chain(Category::iter().map(|category| {
+                            PossibleValue::new(category.into_str())
+                                .help("all rules in this category")
                         })),
                 ),
             ))

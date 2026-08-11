@@ -12,6 +12,7 @@ use types::CompiledPerFileTargetVersionList;
 use ruff_macros::CacheKey;
 use ruff_python_ast::PythonVersion;
 
+use crate::codes::Category;
 use crate::line_width::LineLength;
 use crate::registry::Rule;
 use crate::rules::{
@@ -768,6 +769,14 @@ pub const DEFAULT_SELECTORS: &[RuleSelector] = &[
     RuleSelector::rule(Rule::SysVersion0), // YTT301
     RuleSelector::rule(Rule::SysVersionCmpStr10), // YTT302
     RuleSelector::rule(Rule::SysVersionSlice1), // YTT303
+];
+
+pub const PREVIEW_DEFAULT_SELECTORS: &[RuleSelector] = &[
+    RuleSelector::Category(Category::Correctness),
+    RuleSelector::Category(Category::Suspicious),
+    RuleSelector::Category(Category::Complexity),
+    RuleSelector::Category(Category::Perf),
+    RuleSelector::Category(Category::Style),
 ];
 
 pub const TASK_TAGS: &[&str] = &["TODO", "FIXME", "XXX"];
