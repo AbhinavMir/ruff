@@ -21,12 +21,14 @@ use ruff_python_ast::{
     visitor::source_order::{SourceOrderVisitor, TraversalSignal},
 };
 use ruff_text_size::Ranged;
+use rustc_hash::FxHashSet;
 use ty_project::parallel::{ParallelIteratorExt, minimum_parallel_job_len};
 use ty_python_core::ProgramFile;
 use ty_python_core::definition::{Definition, DefinitionKind, DefinitionState};
 use ty_python_core::scope::{FileScopeId, NodeWithScopeKind, ScopeKind};
 use ty_python_semantic::{
     ImportAliasResolution, ResolvedDefinition, SemanticModel, contains_identifier,
+    fixture_reference_candidates, fixture_reference_targets, pytest_global_plugin_files,
 };
 
 /// Salsa snapshots coordinate clone and drop through shared state. For cached files that don't
@@ -94,6 +96,15 @@ pub(crate) fn references(
     let source_file = file.file(db);
     let model = SemanticModel::new(db, file);
     let target_definitions = goto_target.definitions(&model, mode.to_import_alias_resolution())?;
+    if matches!(
+        mode,
+        ReferencesMode::References | ReferencesMode::ReferencesSkipDeclaration
+    ) {
+        let fixture_targets = fixture_targets_for_definitions(db, &target_definitions);
+        if !fixture_targets.is_empty() {
+            return pytest_fixture_references(db, file, &fixture_targets, mode);
+        }
+    }
     let is_externally_visible_symbol =
         has_any_external_visible_definitions(db, &target_definitions);
     let target_definitions = target_definitions.goto_declaration(&model, goto_target)?;
@@ -162,6 +173,177 @@ pub(crate) fn references(
     }
 }
 
+fn fixture_targets_for_definitions<'db>(
+    db: &'db dyn Db,
+    definitions: &Definitions<'db>,
+) -> Vec<Definition<'db>> {
+    let mut seen = FxHashSet::default();
+    definitions
+        .iter()
+        .filter_map(ResolvedDefinition::definition)
+        .flat_map(|definition| fixture_reference_targets(db, definition).iter().copied())
+        .filter(|definition| seen.insert(*definition))
+        .collect()
+}
+
+fn pytest_fixture_references(
+    db: &dyn Db,
+    source_file: ProgramFile<'_>,
+    fixture_targets: &[Definition<'_>],
+    mode: ReferencesMode,
+) -> Option<Vec<ReferenceTarget>> {
+    let program = source_file.program(db);
+    let mut seen_files = FxHashSet::default();
+    let mut files = Vec::new();
+    for file in std::iter::once(source_file)
+        .chain(
+            db.project()
+                .files(db)
+                .iter()
+                .copied()
+                .map(|file| ProgramFile::new(db, file, program)),
+        )
+        .chain(
+            fixture_targets
+                .iter()
+                .map(|definition| definition.program_file(db)),
+        )
+        .chain(pytest_global_plugin_files(db, source_file).iter().copied())
+    {
+        if seen_files.insert(file.file(db)) {
+            files.push(file);
+        }
+    }
+
+    let fixture_targets = fixture_targets.to_vec();
+    let minimum_job_len = minimum_parallel_job_len(files.len(), MAX_MIN_FILES_PER_PARALLEL_JOB);
+    let references = files
+        .into_par_iter()
+        .with_min_len(minimum_job_len)
+        .map_with_db(db, |db, file| {
+            pytest_fixture_references_for_file(db, file, &fixture_targets, mode)
+        })
+        .flat_map_iter(|references| references)
+        .collect::<Vec<_>>();
+
+    let mut seen_ranges = FxHashSet::default();
+    let references: Vec<_> = references
+        .into_iter()
+        .filter(|reference| seen_ranges.insert(reference.file_range()))
+        .collect();
+    (!references.is_empty()).then_some(references)
+}
+
+fn pytest_fixture_references_for_file<'db>(
+    db: &'db dyn Db,
+    file: ProgramFile<'db>,
+    fixture_targets: &[Definition<'db>],
+    mode: ReferencesMode,
+) -> Vec<ReferenceTarget> {
+    let source = ruff_db::source::source_text(db, file.file(db));
+    let target_set: FxHashSet<_> = fixture_targets.iter().copied().collect();
+    let candidates = fixture_reference_candidates(db, file);
+    let parsed = parsed_module(db, file.python_file(db));
+    let module = parsed.load(db);
+    let mut searches = Vec::new();
+    // Keep declarations for an ambiguous provider branch out of a search that started from a
+    // different branch. Matching requests still participate because they target both fixtures.
+    let mut excluded_declaration_ranges = Vec::new();
+
+    for target in fixture_targets {
+        let Some(name) = target.name(db) else {
+            continue;
+        };
+        push_fixture_reference_search(
+            &mut searches,
+            name,
+            *target,
+            mode.to_import_alias_resolution(),
+        );
+    }
+
+    for candidate in candidates {
+        let candidate_targets = fixture_reference_targets(db, candidate.definition());
+        let matches_target = candidate_targets
+            .iter()
+            .any(|target| target_set.contains(target));
+        if !matches_target {
+            if !candidate_targets.is_empty() {
+                excluded_declaration_ranges
+                    .push(candidate.definition().focus_range(db, &module).range());
+            }
+            continue;
+        }
+
+        let is_parameter = matches!(
+            candidate.definition().kind(db),
+            DefinitionKind::Parameter(_)
+        );
+        let import_alias_resolution = if is_parameter {
+            mode.to_import_alias_resolution()
+        } else {
+            // An exposure participates through its local binding. Resolving its alias here could
+            // pull in a different definition from an ambiguous provider branch.
+            ImportAliasResolution::PreserveAliases
+        };
+        push_fixture_reference_search(
+            &mut searches,
+            candidate.name().to_owned(),
+            candidate.definition(),
+            import_alias_resolution,
+        );
+    }
+
+    let mut references = Vec::new();
+    for search in searches {
+        if !contains_identifier(&source, &search.name) {
+            continue;
+        }
+        references.extend(references_for_file_with_alias_resolution(
+            db,
+            file,
+            &Definitions::new(search.definitions),
+            &search.name,
+            mode,
+            search.import_alias_resolution,
+        ));
+    }
+
+    references.retain(|reference| {
+        !excluded_declaration_ranges
+            .iter()
+            .any(|range| range.contains_range(reference.range()))
+    });
+    references
+}
+
+struct FixtureReferenceSearch<'db> {
+    name: String,
+    definitions: Vec<ResolvedDefinition<'db>>,
+    import_alias_resolution: ImportAliasResolution,
+}
+
+fn push_fixture_reference_search<'db>(
+    searches: &mut Vec<FixtureReferenceSearch<'db>>,
+    name: String,
+    definition: Definition<'db>,
+    import_alias_resolution: ImportAliasResolution,
+) {
+    if let Some(search) = searches.iter_mut().find(|search| {
+        search.name == name && search.import_alias_resolution == import_alias_resolution
+    }) {
+        search
+            .definitions
+            .push(ResolvedDefinition::Definition(definition));
+    } else {
+        searches.push(FixtureReferenceSearch {
+            name,
+            definitions: vec![ResolvedDefinition::Definition(definition)],
+            import_alias_resolution,
+        });
+    }
+}
+
 fn references_for_keyword_arguments_in_file(
     db: &dyn Db,
     file: ProgramFile<'_>,
@@ -187,6 +369,7 @@ fn references_for_keyword_arguments_in_file(
         target_definitions,
         references: &mut references,
         mode,
+        import_alias_resolution: mode.to_import_alias_resolution(),
         target_text,
         ancestors: Vec::new(),
     });
@@ -230,6 +413,24 @@ fn references_for_file(
     target_text: &str,
     mode: ReferencesMode,
 ) -> Vec<ReferenceTarget> {
+    references_for_file_with_alias_resolution(
+        db,
+        file,
+        target_definitions,
+        target_text,
+        mode,
+        mode.to_import_alias_resolution(),
+    )
+}
+
+fn references_for_file_with_alias_resolution(
+    db: &dyn Db,
+    file: ProgramFile<'_>,
+    target_definitions: &Definitions<'_>,
+    target_text: &str,
+    mode: ReferencesMode,
+    import_alias_resolution: ImportAliasResolution,
+) -> Vec<ReferenceTarget> {
     let parsed = parsed_module(db, file.python_file(db));
     let module = parsed.load(db);
     let model = SemanticModel::new(db, file);
@@ -240,6 +441,7 @@ fn references_for_file(
         target_definitions,
         references: &mut references,
         mode,
+        import_alias_resolution,
         tokens: module.tokens(),
         target_text,
         ancestors: Vec::new(),
@@ -379,6 +581,7 @@ struct LocalReferencesFinder<'a> {
     target_definitions: &'a Definitions<'a>,
     references: &'a mut Vec<ReferenceTarget>,
     mode: ReferencesMode,
+    import_alias_resolution: ImportAliasResolution,
     target_text: &'a str,
     ancestors: Vec<AnyNodeRef<'a>>,
 }
@@ -469,6 +672,7 @@ impl<'a> SourceOrderVisitor<'a> for LocalReferencesFinder<'a> {
                         target_definitions: self.target_definitions,
                         references: self.references,
                         mode: self.mode,
+                        import_alias_resolution: self.import_alias_resolution,
                         tokens: sub_ast.tokens(),
                         target_text: self.target_text,
                         ancestors: Vec::new(),
@@ -562,7 +766,7 @@ impl<'a> LocalReferencesFinder<'a> {
             GotoTarget::from_covering_node(self.model, covering_node, offset, self.tokens)?;
 
         let definitions = goto_target
-            .definitions(self.model, self.mode.to_import_alias_resolution())?
+            .definitions(self.model, self.import_alias_resolution)?
             .goto_declaration(self.model, &goto_target)?;
 
         Some(definitions)
