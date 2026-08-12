@@ -4072,6 +4072,31 @@ impl<'db> PathBounds<'db> {
         builder: &ConstraintSetBuilder<'db>,
         path_bound: &PathBound<'db>,
     ) -> Result<Option<Type<'db>>, ()> {
+        Self::default_solve_impl(db, env, builder, path_bound, false)
+    }
+
+    /// Uses the default solution selection for a final specialization, applying static upper
+    /// bounds to gradual alternatives in the lower bound.
+    ///
+    /// Preliminary solves that extract type-context preferences must use [`Self::default_solve`].
+    /// Otherwise, they can commit to an upper bound before the actual inference constraints are
+    /// available.
+    pub(crate) fn default_solve_preserving_static_upper(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        builder: &ConstraintSetBuilder<'db>,
+        path_bound: &PathBound<'db>,
+    ) -> Result<Option<Type<'db>>, ()> {
+        Self::default_solve_impl(db, env, builder, path_bound, true)
+    }
+
+    fn default_solve_impl(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        builder: &ConstraintSetBuilder<'db>,
+        path_bound: &PathBound<'db>,
+        preserve_static_upper: bool,
+    ) -> Result<Option<Type<'db>>, ()> {
         // Choose a solution type that satisfies the constraints on this path, as well as any upper
         // bound or constraints of the typevar itself.
         // TODO: Handle the upper bound/constraints by conjoining them with the constraint set
@@ -4113,31 +4138,55 @@ impl<'db> PathBounds<'db> {
                         return Err(());
                     }
 
-                    // Preserve the static upper bound of a gradual solution.
+                    // Preserve the static upper bound of a gradual solution by distributing it
+                    // across the gradual alternatives in the lower bound. Static alternatives are
+                    // already valid lower endpoints and must remain in the solution.
                     //
                     // If the same gradual type represents both the upper and lower bounds, we avoid
                     // intersecting it with itself, as `Divergent` is not safely reflexive.
-                    if lower.bottom_materialization(db, env) != lower.top_materialization(db, env)
-                        && path_bound
-                            .upper
-                            .as_single_bound(db, env)
-                            .is_some_and(|upper| upper != lower)
+                    if preserve_static_upper
+                        && lower.bottom_materialization(db, env)
+                            != lower.top_materialization(db, env)
+                        && path_bound.has_upper()
+                        && !(path_bound.upper.clauses.len() == 1
+                            && path_bound.upper.clauses.contains(&lower))
+                        && !lower.has_typevar(db, env)
+                        && !lower.has_unspecialized_type_var(db, env)
+                        && declared_upper.is_fully_static(db, env)
                         && path_bound.upper.clauses.iter().all(|upper| {
-                            !upper.has_typevar(db, env)
+                            upper.is_fully_static(db, env)
+                                && !upper.has_typevar(db, env)
                                 && !upper.has_unspecialized_type_var(db, env)
                         })
                     {
-                        return Ok(IntersectionType::bounded_from_elements(
-                            db,
-                            env,
-                            path_bound
-                                .upper
-                                .clauses
-                                .iter()
-                                .copied()
-                                .chain(iter::once(declared_upper))
-                                .chain(iter::once(lower)),
-                        ));
+                        let restrict_gradual = |element: Type<'db>| {
+                            if element.bottom_materialization(db, env)
+                                == element.top_materialization(db, env)
+                            {
+                                Some(element)
+                            } else {
+                                IntersectionType::bounded_from_elements(
+                                    db,
+                                    env,
+                                    path_bound
+                                        .upper
+                                        .clauses
+                                        .iter()
+                                        .copied()
+                                        .chain(iter::once(declared_upper))
+                                        .chain(iter::once(element)),
+                                )
+                            }
+                        };
+                        let solution = match lower {
+                            Type::Union(union) => {
+                                union.try_map(db, env, |element| restrict_gradual(*element))
+                            }
+                            _ => restrict_gradual(lower),
+                        };
+                        if let Some(solution) = solution {
+                            return Ok(Some(solution));
+                        }
                     }
 
                     return Ok(Some(lower));

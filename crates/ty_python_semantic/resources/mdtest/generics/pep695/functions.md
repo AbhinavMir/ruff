@@ -919,6 +919,7 @@ When different arguments provide a gradual lower bound and a static upper bound 
 variable, we preserve the static upper bound in the solution.
 
 ```py
+from collections.abc import Iterable
 from typing import Any, Callable
 from ty_extensions._internal import Unknown
 
@@ -928,6 +929,25 @@ def infer[T](value: T, upper: Callable[[T], None]) -> T:
 def check(any_value: Any, unknown_value: Unknown, upper: Callable[[int], None]):
     reveal_type(infer(any_value, upper))  # revealed: int & Any
     reveal_type(infer(unknown_value, upper))  # revealed: int & Unknown
+```
+
+For a compound lower bound, static alternatives remain lower endpoints while gradual alternatives
+are restricted by the static upper bound.
+
+```py
+class UpperA: ...
+class UpperB: ...
+class Result(UpperA): ...
+
+def reduce_like[T](function: Callable[[T, T], T], values: Iterable[T]) -> T:
+    raise NotImplementedError
+
+def combine(left: UpperA | UpperB, right: UpperA | UpperB) -> Result:
+    raise NotImplementedError
+
+def check_mixed_lower_bound(values: Iterable[Any]):
+    # revealed: Result | (UpperA & Any) | (UpperB & Any)
+    reveal_type(reduce_like(combine, values))
 ```
 
 ## Typevars in a union

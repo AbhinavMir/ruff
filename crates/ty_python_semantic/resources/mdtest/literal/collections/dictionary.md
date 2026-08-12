@@ -326,6 +326,33 @@ def _(y: Y):
     f1(**y.inner)
 ```
 
+## Gradual constraints in a structural type context
+
+Extracting a preferred dictionary specialization from a structural type context can produce a
+gradual lower bound from one protocol member and a static upper bound from another. This preference
+must remain gradual because the literal elements provide the actual inference constraints later.
+
+```py
+from collections.abc import Iterable, ItemsView
+from typing import Any, Protocol, TypeVar
+
+K = TypeVar("K")
+V_co = TypeVar("V_co", covariant=True)
+
+class MutableDictLike(Protocol[K, V_co]):
+    def get(self, key: K, default: Any | None = None, /) -> V_co | None: ...
+    def items(self) -> ItemsView[K, V_co]: ...
+    def keys(self) -> Iterable[K]: ...
+    def __getitem__(self, key: K, /) -> V_co: ...
+    def __setitem__(self, key: K, value: Any, /) -> None: ...
+
+class Command: ...
+
+def check(command: Any):
+    # revealed: dict[str, Any]
+    commands: MutableDictLike[str, type[Command]] = reveal_type({"command": command})
+```
+
 ## Rejected annotations in stubs
 
 Annotation-only declarations in stubs are also bindings. A rejected annotation should fall back to
