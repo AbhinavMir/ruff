@@ -1164,25 +1164,23 @@ def mean(data: DataFrame) -> float:
 x23: Mapping[Hashable, AggregateSpec] = {"col1": ["sum", mean], "col2": mean}
 ```
 
-## Recursive invariant collection contexts
+## Recursive types remain stable in invariant collection contexts
 
-Recursive aliases contain `Divergent` while fixed-point inference is in progress. If an invariant
-collection context produces the same recursive type as both bounds, the solver must not intersect
-the type with itself and accidentally drop a union member.
+An invariant collection context can infer the same recursive type as both bounds. During fixed-point
+inference, that type contains `Divergent`; intersecting two copies would discard a recursive union
+alternative.
 
 ```py
 from collections.abc import MutableMapping, MutableSequence
 from typing import TypeAlias, TypedDict
 
-class RecursiveFile(TypedDict, total=False):
+class Leaf(TypedDict, total=False):
     path: str
 
-RecursiveValue: TypeAlias = (
-    int | RecursiveFile | MutableSequence["RecursiveValue | None"] | MutableMapping[str, "RecursiveValue | None"]
-)
-RecursiveObject: TypeAlias = MutableMapping[str, RecursiveValue | None]
+RecursiveValue: TypeAlias = int | Leaf | MutableSequence["RecursiveValue | None"] | MutableMapping[str, "RecursiveValue | None"]
+RecursiveMapping: TypeAlias = MutableMapping[str, RecursiveValue | None]
 
-value: RecursiveObject = {}
+recursive: RecursiveMapping = {}
 ```
 
 ## Implicit generic class specialization

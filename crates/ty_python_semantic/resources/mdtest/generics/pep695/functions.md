@@ -913,60 +913,68 @@ def g[T: A](b: B[T]):
     return f(b.x)  # Fine
 ```
 
-## Static upper bounds restrict gradual lower bounds
+## Inferred upper bounds restrict gradual solutions
 
-When different arguments provide a gradual lower bound and a static upper bound for the same type
-variable, we preserve the static upper bound in the solution.
+A gradual lower bound does not erase a static upper bound inferred from another argument. The
+solution retains the gradual type, restricted to materializations that satisfy the upper bound.
 
 ```py
 from collections.abc import Iterable
 from typing import Any, Callable
 from ty_extensions._internal import Unknown
 
-def infer[T](value: T, upper: Callable[[T], None]) -> T:
-    return value
+def infer[T](lower: T, upper: Callable[[T], None]) -> T:
+    return lower
 
-def infer_invariant[T](value: T, upper: Callable[[T], None]) -> list[T]:
-    return [value]
-
-def check(any_value: Any, unknown_value: Unknown, upper: Callable[[int], None]):
+def _(any_value: Any, unknown_value: Unknown, upper: Callable[[int], None]):
     reveal_type(infer(any_value, upper))  # revealed: int & Any
     reveal_type(infer(unknown_value, upper))  # revealed: int & Unknown
-    reveal_type(infer_invariant(any_value, upper))  # revealed: list[int & Any]
 ```
 
-For a compound lower bound, static alternatives remain lower endpoints while gradual alternatives
-are restricted by the static upper bound.
+Return-type promotion must start from the same restricted solution when the type variable occurs in
+an invariant position:
 
 ```py
-class UpperA: ...
-class UpperB: ...
-class Result(UpperA): ...
+def infer_list[T](lower: T, upper: Callable[[T], None]) -> list[T]:
+    return [lower]
 
-def reduce_like[T](function: Callable[[T, T], T], values: Iterable[T]) -> T:
-    raise NotImplementedError
-
-def combine(left: UpperA | UpperB, right: UpperA | UpperB) -> Result:
-    raise NotImplementedError
-
-def check_mixed_lower_bound(values: Iterable[Any]):
-    # revealed: Result | (UpperA & Any) | (UpperB & Any)
-    reveal_type(reduce_like(combine, values))
+def _(any_value: Any, upper: Callable[[int], None]):
+    reveal_type(infer_list(any_value, upper))  # revealed: list[int & Any]
 ```
 
-A redundant inferred upper bound does not cause the declared upper bound to become part of a gradual
-solution.
+Multiple lower bounds form a union. Static alternatives already satisfy the upper bound and remain
+unchanged; only the gradual alternatives are restricted:
 
 ```py
-def infer_bounded[T: UpperA | UpperB](value: T) -> T:
+class A: ...
+class B: ...
+class Result(A): ...
+
+def reduce[T](function: Callable[[T, T], T], values: Iterable[T]) -> T:
+    raise NotImplementedError
+
+def combine(left: A | B, right: A | B) -> Result:
+    raise NotImplementedError
+
+def _(values: Iterable[Any]):
+    # revealed: Result | (A & Any) | (B & Any)
+    reveal_type(reduce(combine, values))
+```
+
+A declared bound validates a solution, but is not inferred upper-bound evidence. Adding the
+redundant constraint `T <: object` therefore does not insert the declared bound into an `Any`
+solution:
+
+```py
+def bounded[T: A | B](value: T) -> T:
     return value
 
-def infer_bounded_with_upper[T: UpperA | UpperB](value: T, upper: Callable[[T], None]) -> T:
+def bounded_with_upper[T: A | B](value: T, upper: Callable[[T], None]) -> T:
     return value
 
-def check_declared_upper(any_value: Any, upper: Callable[[object], None]):
-    reveal_type(infer_bounded(any_value))  # revealed: Any
-    reveal_type(infer_bounded_with_upper(any_value, upper))  # revealed: Any
+def _(any_value: Any, upper: Callable[[object], None]):
+    reveal_type(bounded(any_value))  # revealed: Any
+    reveal_type(bounded_with_upper(any_value, upper))  # revealed: Any
 ```
 
 ## Typevars in a union

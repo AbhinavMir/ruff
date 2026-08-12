@@ -2588,9 +2588,9 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                     return Ok(Some(ty));
                 }
 
-                // Unlike type-context preference extraction, this final solve combines all
-                // available inference constraints. A static upper bound from one argument must
-                // therefore continue to restrict gradual lower-bound alternatives from another.
+                // Every argument has contributed its constraints to this final projection. Retain
+                // an inferred static upper bound when another argument supplied a gradual lower
+                // bound; preliminary type-context projection deliberately uses `default_solve`.
                 PathBounds::default_solve_preserving_static_upper(
                     db,
                     self.env,

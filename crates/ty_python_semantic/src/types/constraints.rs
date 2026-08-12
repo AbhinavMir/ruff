@@ -4075,12 +4075,11 @@ impl<'db> PathBounds<'db> {
         Self::default_solve_impl(db, env, builder, path_bound, false)
     }
 
-    /// Uses the default solution selection for a final specialization, applying static inferred
-    /// upper bounds to gradual alternatives in the lower bound.
+    /// Selects a final solution while retaining static inferred upper bounds on gradual lower-bound
+    /// alternatives.
     ///
-    /// Preliminary solves that extract type-context preferences must use [`Self::default_solve`].
-    /// Otherwise, they can commit to an upper bound before the actual inference constraints are
-    /// available.
+    /// Type-context preferences are solved before all inference constraints are available, and must
+    /// use [`Self::default_solve`] instead.
     pub(crate) fn default_solve_preserving_static_upper(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
@@ -4138,14 +4137,18 @@ impl<'db> PathBounds<'db> {
                         return Err(());
                     }
 
-                    // Preserve the static inferred upper bounds of a gradual solution by
-                    // distributing them across the gradual alternatives in the lower bound. Static
-                    // alternatives are already valid lower endpoints and must remain in the
-                    // solution. The declared upper bound only validates the solution above; as in
-                    // the ordinary lower-bound case, it does not become part of the inferred type.
+                    // Restrict each gradual lower-bound alternative by the inferred static upper
+                    // bounds. Static alternatives already satisfy those bounds and remain unchanged.
+                    // The declared upper bound only validates the solution; default lower-bound
+                    // selection does not add it to the inferred type.
                     //
-                    // If the same gradual type represents both the upper and lower bounds, we avoid
-                    // intersecting it with itself, as `Divergent` is not safely reflexive.
+                    // A bound that contains a type variable still represents a relationship that the
+                    // solver must resolve. Intersecting it here would expose that intermediate
+                    // relationship as part of the final specialization.
+                    //
+                    // Recursive inference can produce the same `Divergent`-bearing type as both
+                    // bounds. Avoid intersecting that type with itself, since `Divergent` is not
+                    // safely reflexive.
                     if preserve_static_upper
                         && lower.bottom_materialization(db, env)
                             != lower.top_materialization(db, env)
@@ -4185,9 +4188,8 @@ impl<'db> PathBounds<'db> {
                             _ => restrict_gradual(lower),
                         };
                         let Some(solution) = solution else {
-                            // `Type` stores intersections in DNF. If exact distribution exceeds
-                            // its bounded expansion budget, retain the gradual lower bound rather
-                            // than constructing an arbitrarily large type.
+                            // The exact intersection exceeds the DNF expansion budget, and cannot
+                            // remain factored in `Type`. Keep the gradual lower bound instead.
                             return Ok(Some(lower));
                         };
                         return Ok(Some(solution));

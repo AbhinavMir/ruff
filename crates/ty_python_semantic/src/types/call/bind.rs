@@ -5922,8 +5922,8 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                 return None;
             }
 
-            // Promotion is an override of the default solution, so apply it after static upper
-            // bounds have restricted any gradual alternatives in the lower bound.
+            // Promoting the raw lower bound would discard static upper bounds inferred from other
+            // arguments. Solve the complete bounds first, then promote the selected solution.
             let Ok(Some(solution)) = PathBounds::default_solve_preserving_static_upper(
                 db,
                 self.env,

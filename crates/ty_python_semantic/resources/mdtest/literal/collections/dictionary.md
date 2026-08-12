@@ -326,11 +326,12 @@ def _(y: Y):
     f1(**y.inner)
 ```
 
-## Gradual constraints in a structural type context
+## Type-context preferences retain graduality
 
-Extracting a preferred dictionary specialization from a structural type context can produce a
-gradual lower bound from one protocol member and a static upper bound from another. This preference
-must remain gradual because the literal elements provide the actual inference constraints later.
+A structural type context is solved before dictionary elements contribute their constraints. Here,
+the protocol infers `Any` as a lower bound for the dictionary value type and `type[Command]` as an
+upper bound. This preliminary solution must remain `Any`; the literal element determines the final
+specialization later.
 
 ```py
 from collections.abc import Iterable, ItemsView
@@ -339,7 +340,7 @@ from typing import Any, Protocol, TypeVar
 K = TypeVar("K")
 V_co = TypeVar("V_co", covariant=True)
 
-class MutableDictLike(Protocol[K, V_co]):
+class DictLike(Protocol[K, V_co]):
     def get(self, key: K, default: Any | None = None, /) -> V_co | None: ...
     def items(self) -> ItemsView[K, V_co]: ...
     def keys(self) -> Iterable[K]: ...
@@ -348,9 +349,9 @@ class MutableDictLike(Protocol[K, V_co]):
 
 class Command: ...
 
-def check(command: Any):
+def _(command: Any):
     # revealed: dict[str, Any]
-    commands: MutableDictLike[str, type[Command]] = reveal_type({"command": command})
+    mapping: DictLike[str, type[Command]] = reveal_type({"command": command})
 ```
 
 ## Rejected annotations in stubs
