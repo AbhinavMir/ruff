@@ -5922,8 +5922,17 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                 return None;
             }
 
-            let lower = bounds.lower?;
-            let promoted = lower.promote(db, self.env);
+            // Promotion is an override of the default solution, so apply it after static upper
+            // bounds have restricted any gradual alternatives in the lower bound.
+            let Ok(Some(solution)) = PathBounds::default_solve_preserving_static_upper(
+                db,
+                self.env,
+                constraints,
+                bounds,
+            ) else {
+                return None;
+            };
+            let promoted = solution.promote(db, self.env);
 
             // If the TypeVar has an upper bound, only use the promoted type if it
             // still satisfies the bound.

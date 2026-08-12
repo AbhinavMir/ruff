@@ -4075,8 +4075,8 @@ impl<'db> PathBounds<'db> {
         Self::default_solve_impl(db, env, builder, path_bound, false)
     }
 
-    /// Uses the default solution selection for a final specialization, applying static upper
-    /// bounds to gradual alternatives in the lower bound.
+    /// Uses the default solution selection for a final specialization, applying static inferred
+    /// upper bounds to gradual alternatives in the lower bound.
     ///
     /// Preliminary solves that extract type-context preferences must use [`Self::default_solve`].
     /// Otherwise, they can commit to an upper bound before the actual inference constraints are
@@ -4138,9 +4138,11 @@ impl<'db> PathBounds<'db> {
                         return Err(());
                     }
 
-                    // Preserve the static upper bound of a gradual solution by distributing it
-                    // across the gradual alternatives in the lower bound. Static alternatives are
-                    // already valid lower endpoints and must remain in the solution.
+                    // Preserve the static inferred upper bounds of a gradual solution by
+                    // distributing them across the gradual alternatives in the lower bound. Static
+                    // alternatives are already valid lower endpoints and must remain in the
+                    // solution. The declared upper bound only validates the solution above; as in
+                    // the ordinary lower-bound case, it does not become part of the inferred type.
                     //
                     // If the same gradual type represents both the upper and lower bounds, we avoid
                     // intersecting it with itself, as `Divergent` is not safely reflexive.
@@ -4152,7 +4154,6 @@ impl<'db> PathBounds<'db> {
                             && path_bound.upper.clauses.contains(&lower))
                         && !lower.has_typevar(db, env)
                         && !lower.has_unspecialized_type_var(db, env)
-                        && declared_upper.is_fully_static(db, env)
                         && path_bound.upper.clauses.iter().all(|upper| {
                             upper.is_fully_static(db, env)
                                 && !upper.has_typevar(db, env)
@@ -4173,7 +4174,6 @@ impl<'db> PathBounds<'db> {
                                         .clauses
                                         .iter()
                                         .copied()
-                                        .chain(iter::once(declared_upper))
                                         .chain(iter::once(element)),
                                 )
                             }
@@ -4184,9 +4184,13 @@ impl<'db> PathBounds<'db> {
                             }
                             _ => restrict_gradual(lower),
                         };
-                        if let Some(solution) = solution {
-                            return Ok(Some(solution));
-                        }
+                        let Some(solution) = solution else {
+                            // `Type` stores intersections in DNF. If exact distribution exceeds
+                            // its bounded expansion budget, retain the gradual lower bound rather
+                            // than constructing an arbitrarily large type.
+                            return Ok(Some(lower));
+                        };
+                        return Ok(Some(solution));
                     }
 
                     return Ok(Some(lower));

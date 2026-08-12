@@ -926,9 +926,13 @@ from ty_extensions._internal import Unknown
 def infer[T](value: T, upper: Callable[[T], None]) -> T:
     return value
 
+def infer_invariant[T](value: T, upper: Callable[[T], None]) -> list[T]:
+    return [value]
+
 def check(any_value: Any, unknown_value: Unknown, upper: Callable[[int], None]):
     reveal_type(infer(any_value, upper))  # revealed: int & Any
     reveal_type(infer(unknown_value, upper))  # revealed: int & Unknown
+    reveal_type(infer_invariant(any_value, upper))  # revealed: list[int & Any]
 ```
 
 For a compound lower bound, static alternatives remain lower endpoints while gradual alternatives
@@ -948,6 +952,21 @@ def combine(left: UpperA | UpperB, right: UpperA | UpperB) -> Result:
 def check_mixed_lower_bound(values: Iterable[Any]):
     # revealed: Result | (UpperA & Any) | (UpperB & Any)
     reveal_type(reduce_like(combine, values))
+```
+
+A redundant inferred upper bound does not cause the declared upper bound to become part of a gradual
+solution.
+
+```py
+def infer_bounded[T: UpperA | UpperB](value: T) -> T:
+    return value
+
+def infer_bounded_with_upper[T: UpperA | UpperB](value: T, upper: Callable[[T], None]) -> T:
+    return value
+
+def check_declared_upper(any_value: Any, upper: Callable[[object], None]):
+    reveal_type(infer_bounded(any_value))  # revealed: Any
+    reveal_type(infer_bounded_with_upper(any_value, upper))  # revealed: Any
 ```
 
 ## Typevars in a union
