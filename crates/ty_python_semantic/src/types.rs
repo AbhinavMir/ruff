@@ -25,7 +25,10 @@ use ty_module_resolver::{ImportingFile, KnownModule, Module, ModuleName, resolve
 pub(crate) use self::callable::UpcastPolicy;
 pub use self::cyclic::CycleDetector;
 pub(crate) use self::cyclic::TypeTransformer;
-pub use self::dedicated::pytest::{FixtureBinding, fixture_bindings_for_parameter};
+pub use self::dedicated::pytest::{
+    FixtureBinding, SyntheticFixture, fixture_bindings_for_parameter, pytest_global_plugin_files,
+    synthetic_fixture_for_parameter,
+};
 pub(crate) use self::diagnostic::TypeCheckDiagnostics;
 pub(crate) use self::diagnostic::register_lints;
 pub use self::diagnostic::{UNDEFINED_REVEAL, UNRESOLVED_REFERENCE};

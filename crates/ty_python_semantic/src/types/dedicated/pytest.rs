@@ -3,7 +3,9 @@ use ruff_db::parsed::{ParsedModuleRef, parsed_module};
 use ruff_python_ast::{self as ast, name::Name};
 use ruff_text_size::Ranged;
 use rustc_hash::FxHashSet;
-use ty_module_resolver::{ImportingFile, KnownModule, file_to_module, resolve_module};
+use ty_module_resolver::{
+    ImportingFile, KnownModule, ModuleName, file_to_module, resolve_module, resolve_real_module,
+};
 use ty_python_core::definition::{Definition, DefinitionKind};
 use ty_python_core::scope::{FileScopeId, ScopeId, ScopeKind};
 use ty_python_core::{ProgramFile, global_scope, place_table, semantic_index, use_def_map};
@@ -20,8 +22,8 @@ use crate::types::{ClassBase, ProgramEnvironment, Type};
 
 /// Resolve the pytest fixtures requested by `parameter`.
 ///
-/// This query searches the parameter's class hierarchy, module, and enclosing conftest hierarchy.
-/// Built-in and plugin fixtures are added by later provider layers.
+/// This query searches the parameter's class hierarchy, module, enclosing conftest hierarchy, and
+/// installed core pytest plugins.
 #[salsa::tracked(returns(ref), heap_size=ruff_memory_usage::heap_size)]
 pub fn fixture_bindings_for_parameter<'db>(
     db: &'db dyn Db,
@@ -30,6 +32,9 @@ pub fn fixture_bindings_for_parameter<'db>(
     let Some(request) = FixtureRequest::from_parameter(db, parameter) else {
         return Box::default();
     };
+    if request.name == "request" {
+        return Box::default();
+    }
 
     for class_scope in class_provider_scopes(db, &request) {
         let bindings = bindings_in_provider(db, &request, class_scope);
@@ -46,6 +51,13 @@ pub fn fixture_bindings_for_parameter<'db>(
 
     for conftest in conftest_files(db, request_file) {
         let bindings = bindings_in_provider(db, &request, global_scope(db, *conftest));
+        if !bindings.is_empty() {
+            return bindings;
+        }
+    }
+
+    for plugin in pytest_global_plugin_files(db, request_file).iter().rev() {
+        let bindings = bindings_in_provider(db, &request, global_scope(db, *plugin));
         if !bindings.is_empty() {
             return bindings;
         }
@@ -71,6 +83,77 @@ impl<'db> FixtureBinding<'db> {
     pub fn fixture(self) -> Definition<'db> {
         self.fixture
     }
+}
+
+/// A fixture supplied by pytest without a decorated fixture declaration.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, get_size2::GetSize, salsa::SalsaValue)]
+pub enum SyntheticFixture {
+    /// The built-in `request` fixture.
+    Request,
+}
+
+/// Return the synthetic pytest fixture requested by `parameter`, if any.
+#[salsa::tracked(returns(copy))]
+pub fn synthetic_fixture_for_parameter<'db>(
+    db: &'db dyn Db,
+    parameter: Definition<'db>,
+) -> Option<SyntheticFixture> {
+    let request = FixtureRequest::from_parameter(db, parameter)?;
+    (request.name == "request").then_some(SyntheticFixture::Request)
+}
+
+/// Return the installed core pytest plugin files in registration order.
+#[salsa::tracked(returns(ref), heap_size=ruff_memory_usage::heap_size)]
+pub fn pytest_global_plugin_files<'db>(
+    db: &'db dyn Db,
+    request_file: ProgramFile<'db>,
+) -> Box<[ProgramFile<'db>]> {
+    let importing_file = ImportingFile::ResolverFile(request_file.resolver_file(db));
+    let Some(config_module) =
+        resolve_real_module(db, importing_file, &KnownModule::PytestConfig.name())
+    else {
+        return Box::default();
+    };
+    if config_module.known(db) != Some(KnownModule::PytestConfig) {
+        return Box::default();
+    }
+    let Some(config_file) = config_module.file(db) else {
+        return Box::default();
+    };
+    let config_file = ProgramFile::new(db, config_file, request_file.program(db));
+    let Some(plugin_names) = static_string_sequence_assignment(db, config_file, "default_plugins")
+    else {
+        return Box::default();
+    };
+
+    let config_search_path = config_module.search_path(db);
+    let importing_file = ImportingFile::ResolverFile(config_file.resolver_file(db));
+    let mut seen = FxHashSet::default();
+    let mut plugins = Vec::new();
+    for plugin_name in plugin_names {
+        let qualified_name = if plugin_name.starts_with("_pytest.") {
+            plugin_name
+        } else {
+            format!("_pytest.{plugin_name}")
+        };
+        if !seen.insert(qualified_name.clone()) {
+            continue;
+        }
+        let Some(module_name) = ModuleName::new(&qualified_name) else {
+            return Box::default();
+        };
+        let Some(module) = resolve_real_module(db, importing_file, &module_name) else {
+            continue;
+        };
+        if module.search_path(db) != config_search_path {
+            continue;
+        }
+        if let Some(file) = module.file(db) {
+            plugins.push(ProgramFile::new(db, file, request_file.program(db)));
+        }
+    }
+
+    plugins.into_boxed_slice()
 }
 
 #[derive(Debug)]
@@ -521,6 +604,88 @@ fn static_string_list(expression: &ast::Expr) -> Option<Vec<&str>> {
         .collect()
 }
 
+fn static_string_sequence_assignment(
+    db: &dyn Db,
+    file: ProgramFile<'_>,
+    name: &str,
+) -> Option<Vec<String>> {
+    let module = parsed_module(db, file.python_file(db)).load(db);
+    let definition = end_of_scope_definition(db, file, name)?;
+    static_string_sequence_from_definition(db, file, &module, definition, &mut FxHashSet::default())
+}
+
+fn static_string_sequence_from_definition<'db>(
+    db: &'db dyn Db,
+    file: ProgramFile<'db>,
+    module: &ParsedModuleRef,
+    definition: Definition<'db>,
+    active: &mut FxHashSet<Definition<'db>>,
+) -> Option<Vec<String>> {
+    if !active.insert(definition) {
+        return None;
+    }
+
+    let expression = match definition.kind(db) {
+        DefinitionKind::Assignment(assignment) => Some(assignment.value(module)),
+        DefinitionKind::AnnotatedAssignment(assignment) => assignment.value(module),
+        _ => None,
+    };
+    let result = expression.and_then(|expression| {
+        static_string_sequence_from_expression(db, file, module, expression, active)
+    });
+    active.remove(&definition);
+    result
+}
+
+fn static_string_sequence_from_expression<'db>(
+    db: &'db dyn Db,
+    file: ProgramFile<'db>,
+    module: &ParsedModuleRef,
+    expression: &ast::Expr,
+    active: &mut FxHashSet<Definition<'db>>,
+) -> Option<Vec<String>> {
+    if let ast::Expr::Name(name) = expression {
+        let definition = end_of_scope_definition(db, file, name.id.as_str())?;
+        return static_string_sequence_from_definition(db, file, module, definition, active);
+    }
+
+    let elements = expression
+        .as_tuple_expr()
+        .map(|tuple| tuple.elts.as_slice())
+        .or_else(|| expression.as_list_expr().map(|list| list.elts.as_slice()))?;
+    let mut strings = Vec::new();
+    for element in elements {
+        if let Some(string) = element.as_string_literal_expr() {
+            strings.push(string.value.to_str().to_owned());
+        } else if let ast::Expr::Starred(starred) = element {
+            strings.extend(static_string_sequence_from_expression(
+                db,
+                file,
+                module,
+                &starred.value,
+                active,
+            )?);
+        } else {
+            return None;
+        }
+    }
+    Some(strings)
+}
+
+fn end_of_scope_definition<'db>(
+    db: &'db dyn Db,
+    file: ProgramFile<'db>,
+    name: &str,
+) -> Option<Definition<'db>> {
+    let scope = global_scope(db, file);
+    let symbol = place_table(db, scope).symbol_id(name)?;
+    let mut definitions = use_def_map(db, scope)
+        .end_of_scope_symbol_bindings(symbol)
+        .filter_map(|binding| binding.binding.definition());
+    let definition = definitions.next()?;
+    definitions.next().is_none().then_some(definition)
+}
+
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
@@ -532,7 +697,10 @@ mod tests {
     use ty_python_core::scope::ScopeKind;
     use ty_python_core::semantic_index;
 
-    use super::fixture_bindings_for_parameter;
+    use super::{
+        SyntheticFixture, fixture_bindings_for_parameter, pytest_global_plugin_files,
+        synthetic_fixture_for_parameter,
+    };
     use crate::Db as _;
     use crate::db::tests::{TestDb, TestDbBuilder};
 
@@ -1151,6 +1319,85 @@ def replacement(): ...
         Ok(())
     }
 
+    #[test]
+    fn resolves_installed_core_plugins_in_registration_order() -> Result<()> {
+        let db = pytest_db(
+            "/src/test_example.py",
+            r#"
+def test_use(core_value, tmp_path, unused_fixture, request): ...
+"#,
+        )?;
+
+        assert_eq!(
+            fixture_provider_files(&db, "/src/test_example.py", "test_use", "core_value"),
+            ["/site-packages/_pytest/override.py"]
+        );
+        assert_eq!(
+            fixture_provider_files(&db, "/src/test_example.py", "test_use", "tmp_path"),
+            ["/site-packages/_pytest/tmpdir.py"]
+        );
+        assert!(fixture_names(&db, "test_use", "unused_fixture").is_empty());
+
+        let request = parameter_definition(&db, "/src/test_example.py", "test_use", "request");
+        assert!(fixture_bindings_for_parameter(&db, request).is_empty());
+        assert_eq!(
+            synthetic_fixture_for_parameter(&db, request),
+            Some(SyntheticFixture::Request)
+        );
+
+        let test_file = db.program_file(system_path_to_file(&db, "/src/test_example.py")?);
+        let plugin_files: Vec<_> = pytest_global_plugin_files(&db, test_file)
+            .iter()
+            .map(|file| file.file(&db).path(&db).to_string())
+            .collect();
+        assert_eq!(
+            plugin_files,
+            [
+                "/site-packages/_pytest/baseplugin.py",
+                "/site-packages/_pytest/tmpdir.py",
+                "/site-packages/_pytest/override.py",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn project_fixtures_shadow_installed_core_plugins() -> Result<()> {
+        let db = pytest_db(
+            "/src/test_example.py",
+            r#"
+import pytest
+
+@pytest.fixture
+def core_value(): ...
+
+def test_use(core_value): ...
+"#,
+        )?;
+
+        assert_eq!(
+            fixture_provider_files(&db, "/src/test_example.py", "test_use", "core_value"),
+            ["/src/test_example.py"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn declines_dynamic_core_plugin_registries() -> Result<()> {
+        let db = pytest_db_with_config(
+            &[("/src/test_example.py", "def test_use(core_value): ...")],
+            r#"
+def plugins():
+    return ("baseplugin",)
+
+default_plugins = plugins()
+"#,
+        )?;
+
+        assert!(fixture_names(&db, "test_use", "core_value").is_empty());
+        Ok(())
+    }
+
     fn fixture_names(db: &TestDb, function: &str, parameter: &str) -> Vec<String> {
         let path = if system_path_to_file(db, "/src/test_example.py").is_ok() {
             "/src/test_example.py"
@@ -1248,9 +1495,25 @@ def replacement(): ...
     }
 
     fn pytest_db_with_files(files: &[(&'static str, &'static str)]) -> Result<TestDb> {
+        pytest_db_with_config(
+            files,
+            r#"
+essential_plugins = ("baseplugin",)
+additional_plugins = ["tmpdir", "_pytest.tmpdir", "override", "_pytest.override"]
+default_plugins = (*essential_plugins, *additional_plugins)
+"#,
+        )
+    }
+
+    fn pytest_db_with_config(
+        files: &[(&'static str, &'static str)],
+        config: &'static str,
+    ) -> Result<TestDb> {
         let mut builder = TestDbBuilder::new()
             .with_site_packages()
+            .with_file("/site-packages/_pytest/__init__.py", "")
             .with_file("/site-packages/_pytest/__init__.pyi", "")
+            .with_file("/site-packages/_pytest/config/__init__.py", config)
             .with_file("/site-packages/_pytest/mark/__init__.pyi", "")
             .with_file(
                 "/site-packages/_pytest/mark/structures.pyi",
@@ -1287,6 +1550,42 @@ from _pytest.fixtures import fixture as fixture, yield_fixture as yield_fixture
 from _pytest.mark.structures import MarkGenerator
 
 mark: MarkGenerator
+"#,
+            )
+            .with_file(
+                "/site-packages/_pytest/baseplugin.py",
+                r#"
+from _pytest.fixtures import fixture
+
+@fixture
+def core_value(): ...
+"#,
+            )
+            .with_file(
+                "/site-packages/_pytest/tmpdir.py",
+                r#"
+from _pytest.fixtures import fixture
+
+@fixture
+def tmp_path(): ...
+"#,
+            )
+            .with_file(
+                "/site-packages/_pytest/override.py",
+                r#"
+from _pytest.fixtures import fixture
+
+@fixture
+def core_value(): ...
+"#,
+            )
+            .with_file(
+                "/site-packages/_pytest/unused.py",
+                r#"
+from _pytest.fixtures import fixture
+
+@fixture
+def unused_fixture(): ...
 "#,
             );
         for (path, source) in files {
