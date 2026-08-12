@@ -27,12 +27,13 @@ use crate::types::typed_dict::{
     TypedDictAssignmentKind, TypedDictExtraItems, TypedDictKeyAssignment,
 };
 use crate::types::typevar::TypeVarSet;
+use crate::types::visitor::any_over_expanded_type;
 use crate::types::{
     BoundTypeVarInstance, CallArguments, CallDunderError, CallableBinding, CycleDetector,
     DynamicType, InternedType, KnownClass, KnownInstanceType, LintDiagnosticGuard,
     MemberLookupPolicy, Parameter, Parameters, SpecialFormType, StaticClassLiteral, Type,
     TypeAliasType, TypeAndQualifiers, TypeContext, TypeVarBoundOrConstraints, UnionType,
-    UnionTypeInstance, any_over_type, todo_type,
+    UnionTypeInstance, todo_type,
 };
 use crate::{Db, FxOrderSet, ProgramEnvironment};
 use ty_python_core::definition::Definition;
@@ -2478,6 +2479,24 @@ fn infer_legacy_generic_subscript<'db>(
     }
 }
 
+/// Return whether an invalid `Generic` or `Protocol` argument contains a `TypeVarTuple`.
+fn contains_nested_typevartuple_instance<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+) -> bool {
+    any_over_expanded_type(db, env, ty, |ty| {
+        let Type::NominalInstance(instance) = ty else {
+            return false;
+        };
+
+        matches!(
+            instance.known_class(db),
+            Some(KnownClass::TypeVarTuple | KnownClass::ExtensionsTypeVarTuple)
+        )
+    })
+}
+
 /// Parse the type arguments to `Generic[...]` or `Protocol[...]` and validate
 /// that each argument is a type variable.
 fn legacy_generic_class_context<'db>(
@@ -2541,13 +2560,7 @@ fn legacy_generic_class_context<'db>(
             )
         {
             return Err(LegacyGenericContextError::TypeVarTupleMustBeUnpacked(None));
-        } else if any_over_type(db, env, argument_ty, true, |inner_ty| match inner_ty {
-            Type::NominalInstance(nominal) => matches!(
-                nominal.known_class(db),
-                Some(KnownClass::TypeVarTuple | KnownClass::ExtensionsTypeVarTuple)
-            ),
-            _ => false,
-        }) {
+        } else if contains_nested_typevartuple_instance(db, env, argument_ty) {
             return Err(LegacyGenericContextError::NotYetSupported);
         } else {
             return Err(LegacyGenericContextError::InvalidArgument(argument_ty));

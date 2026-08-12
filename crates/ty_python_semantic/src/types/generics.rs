@@ -14,6 +14,7 @@ use crate::types::constraints::{
     ConstraintBounds, ConstraintSet, ConstraintSetBuilder, IteratorConstraintsExtension, PathBound,
     PathBounds, Solutions,
 };
+use crate::types::cyclic::{ActiveRecursionDetector, TypeIdentity};
 use crate::types::infer::original_class_type;
 use crate::types::relation::{
     DisjointnessChecker, HasRelationToVisitor, IsDisjointVisitor, TypeRelation,
@@ -356,7 +357,7 @@ pub(super) fn walk_generic_context<'db, V: TypeVisitor<'db> + ?Sized>(
     visitor: &V,
 ) {
     for bound_typevar in context.variables(db) {
-        visitor.visit_bound_type_var_type(db, bound_typevar);
+        visitor.visit_type(db, Type::TypeVar(bound_typevar));
     }
 }
 
@@ -525,10 +526,6 @@ impl<'db> GenericContext<'db> {
         impl<'db> TypeVisitor<'db> for CollectTypeVars<'_, 'db> {
             fn program_environment(&self) -> &ProgramEnvironment<'db> {
                 self.env
-            }
-
-            fn should_visit_lazy_type_attributes(&self) -> bool {
-                false
             }
 
             fn visit_bound_type_var_type(
@@ -820,6 +817,7 @@ impl<'db> GenericContext<'db> {
             env: &'a ProgramEnvironment<'db>,
             locations: RefCell<TypeVarLocations<'db>>,
             recursion_guard: TypeCollector<'db>,
+            active_type_aliases: ActiveRecursionDetector<TypeIdentity<'db>>,
             in_return_type: bool,
             in_callable_type: Cell<Option<CallableType<'db>>>,
         }
@@ -827,10 +825,6 @@ impl<'db> GenericContext<'db> {
         impl<'db> TypeVisitor<'db> for FindTypeVarLocations<'_, 'db> {
             fn program_environment(&self) -> &ProgramEnvironment<'db> {
                 self.env
-            }
-
-            fn should_visit_lazy_type_attributes(&self) -> bool {
-                false
             }
 
             fn visit_bound_type_var_type(
@@ -872,17 +866,24 @@ impl<'db> GenericContext<'db> {
             }
 
             fn visit_type_alias_type(&self, db: &'db dyn Db, type_alias: TypeAliasType<'db>) {
-                // The default implementation would do this for us if we returned `true` from
-                // `should_visit_lazy_type_attributes`. However, this is the _only_ lazy type
-                // attribute that we want to recurse into, so we do it by hand.
-                match type_alias {
-                    TypeAliasType::PEP695(type_alias) => {
-                        walk_pep_695_type_alias(db, type_alias, self);
-                    }
-                    TypeAliasType::ManualPEP695(type_alias) => {
-                        walk_manual_pep_695_type_alias(db, type_alias, self);
-                    }
-                }
+                // A recursive alias may change its specialization at each expansion. Stop at
+                // the repeated definition, but still inspect its type arguments for `T`.
+                self.active_type_aliases.visit(
+                    &Type::TypeAlias(type_alias).to_type_identity(db),
+                    || {
+                        if let Some(specialization) = type_alias.specialization(db) {
+                            walk_specialization_values(db, specialization, self);
+                        }
+                    },
+                    || match type_alias {
+                        TypeAliasType::PEP695(type_alias) => {
+                            walk_pep_695_type_alias(db, type_alias, self);
+                        }
+                        TypeAliasType::ManualPEP695(type_alias) => {
+                            walk_manual_pep_695_type_alias(db, type_alias, self);
+                        }
+                    },
+                );
             }
 
             fn visit_type(&self, db: &'db dyn Db, ty: Type<'db>) {
@@ -902,6 +903,7 @@ impl<'db> GenericContext<'db> {
             env: &env,
             locations: RefCell::default(),
             recursion_guard: TypeCollector::default(),
+            active_type_aliases: ActiveRecursionDetector::default(),
             in_return_type: false,
             in_callable_type: Cell::default(),
         };
@@ -1229,12 +1231,14 @@ pub struct Specialization<'db> {
 // The Salsa heap is tracked separately.
 impl get_size2::GetSize for Specialization<'_> {}
 
-pub(super) fn walk_specialization<'db, V: TypeVisitor<'db> + ?Sized>(
+/// Visit the type arguments and variadic tuple elements of a specialization.
+///
+/// Type parameter bounds and defaults are not part of the specialization.
+pub(super) fn walk_specialization_values<'db, V: TypeVisitor<'db> + ?Sized>(
     db: &'db dyn Db,
     specialization: Specialization<'db>,
     visitor: &V,
 ) {
-    walk_generic_context(db, specialization.generic_context(db), visitor);
     for ty in specialization.types(db) {
         visitor.visit_type(db, *ty);
     }
@@ -1762,7 +1766,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             // Performance only: `source_top != source` below already handles unchanged
             // arguments. Without expanding aliases, treat them as potentially gradual.
             source.types(db).iter().any(|ty| {
-                any_over_type(db, env, *ty, false, |ty| {
+                any_over_type(db, env, *ty, |ty| {
                     ty.is_dynamic() || matches!(ty, Type::TypeAlias(_))
                 })
             })
@@ -2663,7 +2667,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                 .iter_positive(db)
                 .chain(intersection.iter_negative(db))
                 .any(|element| self.has_expanding_cycle(generic_context, types, identity, element)),
-            _ => any_over_type(db, self.env, ty, false, |nested| {
+            _ => any_over_type(db, self.env, ty, |nested| {
                 nested.as_typevar().is_some_and(|dependency| {
                     let dependency = dependency.identity(db);
                     dependency != identity
@@ -2697,7 +2701,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         }
 
         types.get(&identity).is_some_and(|ty| {
-            any_over_type(db, self.env, *ty, false, |nested| {
+            any_over_type(db, self.env, *ty, |nested| {
                 nested.as_typevar().is_some_and(|dependency| {
                     let dependency = dependency.identity(db);
                     // Recursive specialization skips a typevar's own slot. Only references
