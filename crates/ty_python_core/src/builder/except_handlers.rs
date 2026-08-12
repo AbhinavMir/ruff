@@ -1,5 +1,5 @@
 use crate::reachability_constraints::ScopedReachabilityConstraintId;
-use crate::use_def::{ControlFlowRevision, FlowSnapshot, ScopedDefinitionId, UseDefMapBuilder};
+use crate::use_def::{FlowSnapshot, ScopedDefinitionId, UseDefMapBuilder};
 
 use super::SemanticIndexBuilder;
 
@@ -199,7 +199,9 @@ impl TryNodeContextStack {
                 ExceptionHandlers::None => context.has_escaping_exception = true,
                 ExceptionHandlers::Propagating(snapshots)
                 | ExceptionHandlers::CatchAll(snapshots) => {
-                    if context.last_checkpoint_key != Some(checkpoint_key) {
+                    if use_def_map.reachability_constraints.is_saturated()
+                        || context.last_checkpoint_key != Some(checkpoint_key)
+                    {
                         snapshots.push(
                             snapshot
                                 .get_or_insert_with(|| use_def_map.snapshot())
@@ -235,7 +237,7 @@ impl TryNodeContextStack {
 #[derive(Debug, Default)]
 pub(super) struct TryNodeContext {
     exception_handlers: ExceptionHandlers,
-    last_checkpoint_key: Option<(ScopedDefinitionId, ControlFlowRevision)>,
+    last_checkpoint_key: Option<(ScopedDefinitionId, ScopedReachabilityConstraintId)>,
     /// Whether an exception escaped this suite and must also propagate after its cleanup.
     has_escaping_exception: bool,
     terminal_finally_entry_snapshots: Vec<FlowSnapshot>,
